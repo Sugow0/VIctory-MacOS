@@ -102,9 +102,15 @@ scripts/macos-setup-bottle.sh --bottle <bottle>   # CrossOver
 scripts/macos-setup-bottle.sh                     # Wine/GPTK: WINEPREFIX, by default ~/.victory-wine
 ```
 
-It picks Wine as the launcher does (and also finds CrossOver in
-`~/Applications`), downloads to a temporary folder, and stops on any
-mismatch. `--dry-run` prints what it would do.
+It picks Wine as the launcher does, refuses a bottle when the Wine picked is
+not CrossOver, and asks CrossOver where the bottle is (`winepath`; else
+`CX_BOTTLE_PATH`, by default `~/Library/Application Support/CrossOver/Bottles`).
+It needs a 64-bit prefix (`syswow64` present), downloads nothing when the
+DLL in place is already the one below, downloads to a temporary folder
+otherwise, and stops on any mismatch. `--dry-run` prints what it would do.
+`osslsigncode` fetches the certificates' revocation lists (CRLs) over
+http, so the signature check fails offline or behind a proxy that blocks
+them.
 
 - Source: the Windows SDK 10.0.26100.9457 (September 2026 servicing), as
   Visual Studio's installer manifest lists it (package
@@ -131,11 +137,16 @@ mismatch. `--dry-run` prints what it would do.
 
 To undo (CrossOver, `wine` being
 `CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`; elsewhere
-`WINEPREFIX=<prefix> wine64` in place of `wine --bottle <bottle>`):
+`WINEPREFIX=<prefix> wine64` in place of `wine --bottle <bottle>`, and the
+prefix's own `drive_c/windows/system32`):
 
 ```sh
 cd "$HOME/Library/Application Support/CrossOver/Bottles/<bottle>/drive_c/windows/system32"
-mv d3dcompiler_47.dll.builtin.bak d3dcompiler_47.dll
+if [ -f d3dcompiler_47.dll.builtin.bak ]; then
+    mv d3dcompiler_47.dll.builtin.bak d3dcompiler_47.dll
+else
+    rm d3dcompiler_47.dll   # there was no builtin file to keep; Wine uses its own
+fi
 wine --bottle <bottle> reg delete 'HKCU\Software\Wine\DllOverrides' /v d3dcompiler_47 /f
 ```
 
