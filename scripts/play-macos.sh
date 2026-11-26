@@ -79,7 +79,7 @@ macos=$(sw_vers -productVersion)
 # reported by cpuid with ROSETTA_ADVERTISE_AVX=1. victory checks AVX2 by
 # cpuid, so it is asked for. Untested here.
 macos_major=${macos%%.*}
-macos_minor=$(printf '%s' "$macos" | cut -d. -f2)
+macos_minor=$(printf '%s' "$macos" | cut -s -d. -f2)
 case "$macos_minor" in ''|*[!0-9]*) macos_minor=0 ;; esac
 [ "$macos_major" -ge 15 ] || die "macOS 15 or later is needed (Rosetta's AVX2); this is $macos"
 if [ "$macos_major" -eq 15 ] && [ "$macos_minor" -lt 4 ]; then

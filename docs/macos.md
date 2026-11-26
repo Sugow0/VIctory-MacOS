@@ -75,7 +75,7 @@ Try `--safe` first.
   scripts/build-windows-on-macos.sh
   ```
 
-  (added by #3, a separate pull request). It lands in
+  (added by Sugow0/VIctory-MacOS#3, a separate pull request). It lands in
   `target/x86_64-pc-windows-msvc/<profile>/victory.exe`. Until then, build
   victory.exe on Windows (README.md) and copy `target\diag\victory.exe` to
   `target/diag/victory.exe` here: the launcher uses it when the first one
