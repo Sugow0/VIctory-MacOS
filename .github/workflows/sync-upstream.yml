@@ -1,0 +1,73 @@
+# Keeps this fork's `main` an exact copy of the Windows team's `main`
+# (avatarmanz/VIctory-7900XTX). Fast-forward only: if `main` here has
+# commits upstream does not, the job fails and changes nothing. Work of
+# this fork goes on `port-macos`, which takes upstream in by merging `main`.
+#
+# Scheduled workflows run from the default branch, so this file lives on
+# `port-macos` (the default branch), never on `main`.
+#
+# Needs the secret SYNC_TOKEN: a personal access token of the fork's owner
+# that may push to this repository and change workflow files (fine-grained:
+# Contents and Workflows, read and write, on this repository only). The
+# built-in GITHUB_TOKEN is refused as soon as an upstream commit changes a
+# file under .github/workflows.
+#
+# Fine-grained tokens expire (a year at most): an expired one shows up as a
+# failed push. GitHub pauses scheduled workflows of a public repository after
+# 60 days without activity; re-enable it from the Actions tab when it does.
+# A push made with this token starts ci.yml on main (upstream's CI, again).
+name: Sync main with upstream
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/avatarmanz/VIctory-7900XTX.git
+
+jobs:
+  sync:
+    name: Fast-forward main
+    runs-on: ubuntu-latest
+    if: github.repository == 'Sugow0/VIctory-MacOS'
+    steps:
+      - name: Check the token
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Secret SYNC_TOKEN is not set (see the comment at the top of this workflow)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Fast-forward main to upstream
+        run: |
+          git fetch --no-tags "$UPSTREAM" main
+          before=$(git rev-parse HEAD)
+          upstream=$(git rev-parse FETCH_HEAD)
+          if [ "$before" = "$upstream" ]; then
+            echo "main is up to date ($before)."
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$before" "$upstream"; then
+            echo "::error::main has commits that upstream does not ($before is not an ancestor of $upstream). Nothing was changed; put fork work on port-macos and reset main by hand."
+            exit 1
+          fi
+          git merge --ff-only FETCH_HEAD
+          git push origin HEAD:main
+          echo "main: $before -> $upstream"
+          git log --oneline "$before..$upstream" | head -50
