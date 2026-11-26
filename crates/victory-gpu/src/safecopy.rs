@@ -562,7 +562,12 @@ fn plain_stores() -> bool {
     *PLAIN.get_or_init(|| match std::env::var_os("VICTORY_SAFE_STORES") {
         Some(v) if v == "plain" => true,
         Some(v) if v == "masked" => false,
-        _ => on_wine(),
+        None => on_wine(),
+        Some(v) => {
+            let wine = on_wine();
+            tracing::warn!(value = ?v, wine, "VICTORY_SAFE_STORES: expected plain or masked; plain under Wine, masked elsewhere");
+            wine
+        }
     })
 }
 
