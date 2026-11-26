@@ -120,7 +120,7 @@ has D3DMetal is not checked; else CrossOver's
 Outside CrossOver the prefix is `WINEPREFIX`, by default `~/.victory-wine`,
 made with `wineboot --init` the first time.
 
-With CrossOver, `CX_BOTTLE` is required: make a bottle (Windows 10 64-bit)
+With CrossOver, `CX_BOTTLE` is required: make a bottle (Windows 10 or 11, 64-bit)
 and turn D3DMetal on in its settings. CrossOver would otherwise use its
 default bottle, which may not have D3DMetal on, so the launcher refuses to
 guess.
@@ -140,6 +140,9 @@ Then turn D3DMetal on by adding, under `[EnvironmentVariables]` in
 ```ini
 "CX_GRAPHICS_BACKEND" = "d3dmetal"
 ```
+
+Edit it with CrossOver closed: choosing D3DMetal in the bottle's settings
+writes the same line, and the settings can rewrite it.
 
 CrossOver 26.3's bottle wrapper accepts `d3dmetal`, `dxmt`, `dxvk` and
 `wined3d` there. Then run with `CX_BOTTLE=victory`.
