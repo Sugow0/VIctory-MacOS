@@ -165,14 +165,37 @@ Which Wine (the launcher always prints the one it chose): `WINE` if set;
 else `/usr/local/opt/game-porting-toolkit/bin/wine64` (Apple's tap, with
 `WINEESYNC=1`); else a `wine64` on `PATH`, with a warning, since whether it
 has D3DMetal is not checked; else CrossOver's
-`/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`.
+`CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`, looked for in
+`/Applications` first, then in `~/Applications`.
 Outside CrossOver the prefix is `WINEPREFIX`, by default `~/.victory-wine`,
 made with `wineboot --init` the first time.
 
-With CrossOver, `CX_BOTTLE` is required: make a bottle (Windows 10 64-bit)
+With CrossOver, `CX_BOTTLE` is required: make a bottle (Windows 10 or 11, 64-bit)
 and turn D3DMetal on in its settings. CrossOver would otherwise use its
 default bottle, which may not have D3DMetal on, so the launcher refuses to
 guess.
+
+Both steps can be done from the command line. `<crossover>` below is
+`/Applications/CrossOver.app/Contents/SharedSupport/CrossOver` or
+`~/Applications/CrossOver.app/Contents/SharedSupport/CrossOver`, wherever
+CrossOver is installed. Make the bottle:
+
+```sh
+<crossover>/bin/cxbottle --bottle victory --create --template win11_64
+```
+
+Then turn D3DMetal on by adding, under `[EnvironmentVariables]` in
+`~/Library/Application Support/CrossOver/Bottles/victory/cxbottle.conf`:
+
+```ini
+"CX_GRAPHICS_BACKEND" = "d3dmetal"
+```
+
+Edit it with CrossOver closed: choosing D3DMetal in the bottle's settings
+writes the same line, and the settings can rewrite it.
+
+CrossOver 26.3's bottle wrapper accepts `d3dmetal`, `dxmt`, `dxvk` and
+`wined3d` there. Then run with `CX_BOTTLE=victory`.
 
 The ahead-of-time steps (README.md) run the same way, through Wine:
 
