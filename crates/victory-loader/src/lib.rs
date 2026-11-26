@@ -21,6 +21,9 @@
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
+// Most of the runtime is Windows-only; elsewhere its helpers go unused.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 #[cfg(windows)]
 mod console_insn;
 #[cfg(windows)]

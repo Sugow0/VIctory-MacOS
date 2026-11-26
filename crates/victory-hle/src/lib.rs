@@ -11,6 +11,9 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+// Most of the runtime is Windows-only; elsewhere its helpers go unused.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 mod host;
 mod image_watch;
 #[cfg(all(windows, feature = "diagnostics"))]
