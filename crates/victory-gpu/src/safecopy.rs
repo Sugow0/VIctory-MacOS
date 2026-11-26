@@ -935,7 +935,8 @@ mod tests {
     /// (a fault in a masked store would hang under Rosetta): bytes changed
     /// here and there, whole blocks changed (stored whole), one block at a
     /// time as [`merge`] does at the ends, and puts at an address that is a
-    /// dword's but no block's.
+    /// dword's but no block's. Each shape comes with changes the title had
+    /// made already (nothing to store) and with new ones.
     #[test]
     fn plain_stores_do_what_masked_ones_do() {
         let (a, b) = (Pages::new(1 << 12), Pages::new(1 << 12));
@@ -947,14 +948,16 @@ mod tests {
             seed
         };
         for round in 0..4000u32 {
+            let (shape, as_title) = (round % 4, (round / 4) % 2 == 0);
             let title: Vec<u8> = (0..4096).map(|_| random() as u8).collect();
             let mut was: Vec<u8> = (0..4096).map(|_| random() as u8).collect();
             let mut now = was.clone();
             for _ in 0..random() % 200 {
                 let i = random() as usize % 4096;
-                now[i] = if round % 2 == 0 { title[i] } else { random() as u8 };
+                now[i] = if as_title { title[i] } else { random() as u8 };
             }
-            if round % 4 == 1 {
+            let mut whole = Vec::new();
+            if shape == 1 {
                 // Whole blocks in which every dword changes.
                 for _ in 0..1 + random() % 40 {
                     let block = random() as usize % 128 * 32;
@@ -962,15 +965,22 @@ mod tests {
                         was[i] = title[i];
                         now[i] = !title[i];
                     }
+                    whole.push(block);
                 }
             }
             // Where and how many blocks: all, one (as at a stretch's ends),
             // or a put 4 bytes into the page.
-            let (from, blocks, at) = match round % 4 {
+            let (from, blocks, at) = match shape {
                 2 => (random() as usize % 128 * 32, 1, 0),
                 3 => (0, 127, 4),
                 _ => (0, 128, 0),
             };
+            if shape == 2 {
+                // A byte of the one block that is new to the title too.
+                let i = from + random() as usize % 32;
+                was[i] = title[i];
+                now[i] = !title[i];
+            }
             let (mut held_a, mut held_b) = (was.clone(), was.clone());
             let (mut counts_a, mut counts_b) = ([0u64; 2], [0u64; 2]);
             // SAFETY: our allocations and vectors, 4096 bytes each; every
@@ -981,10 +991,14 @@ mod tests {
                 let (now_at, held_a_at, held_b_at) = (now.as_ptr().add(from), held_a.as_mut_ptr().add(from), held_b.as_mut_ptr().add(from));
                 assert_eq!(victory_safe_merge(a.0.add(from), now_at, held_a_at, blocks, &mut counts_a), 0);
                 assert_eq!(victory_safe_merge_plain(b.0.add(from), now_at, held_b_at, blocks, &mut counts_b), 0);
-                assert_eq!(std::slice::from_raw_parts(a.0, 4096), std::slice::from_raw_parts(b.0, 4096), "merge, round {round}");
+                let there = std::slice::from_raw_parts(a.0, 4096);
+                assert_eq!(there, std::slice::from_raw_parts(b.0, 4096), "merge, round {round}");
                 assert_eq!((&held_a, counts_a), (&held_b, counts_b), "merge, round {round}");
-                if round % 4 == 1 {
-                    assert!(counts_a[1] >= 8, "round {round}: no whole block stored");
+                for &block in &whole {
+                    assert_eq!(there[block..block + 32], now[block..block + 32], "round {round}: whole block {block}");
+                }
+                if shape == 2 {
+                    assert!(counts_a[1] > 0, "round {round}: the 1-block merge stored nothing");
                 }
                 std::ptr::copy_nonoverlapping(title.as_ptr(), a.0, 4096);
                 std::ptr::copy_nonoverlapping(title.as_ptr(), b.0, 4096);
@@ -1004,8 +1018,14 @@ mod tests {
     /// the second page as it was; a put fails; nothing of the second page is
     /// stored and a guard page stays one. The faults: the read of title
     /// memory (missing, guarded), a dword stored alone (read-only) and a
-    /// whole block stored (read-only, all its dwords changed). Not under
-    /// Wine, the masked stores are held to the same.
+    /// whole block stored (read-only, all its dwords changed); a guard page
+    /// cannot fault a merge's store, as the merge reads the block first.
+    /// A put of a block across the two pages stores, one by one, the dwords
+    /// in the first page (they come before the fault), and fails. Not under
+    /// Wine, the masked stores are held to the same, but for that block:
+    /// whether a masked store that faults stores some of its dwords is the
+    /// processor's, so there each dword of the first page is either as it
+    /// was or new ([`put_changed`]: "then some may have been").
     #[test]
     fn plain_stores_fail_where_title_memory_is_not_there() {
         assert!(on());
@@ -1037,18 +1057,26 @@ mod tests {
                         }
                     };
                 };
-                let after = |pages: &Pages| {
+                // The two pages once the call is over: a guard page must
+                // still be one; then the second is made readable again.
+                // A missing page comes back committed, so zero-filled: that
+                // nothing was stored in it cannot fail there (nothing could
+                // be), it is proven by the other two.
+                let reopen = |pages: &Pages| -> Vec<u8> {
                     let at = pages.0.addr() + 4096;
                     if how == "guarded" {
                         assert!(guarded(at), "{what}: the guard flag was consumed");
                     }
                     let mut old = 0;
                     // SAFETY: as above; then the pages can be read.
-                    let there = unsafe {
+                    unsafe {
                         VirtualAlloc(at as *mut _, 4096, MEM_COMMIT, PAGE_READWRITE);
                         VirtualProtect(at as *mut _, 4096, PAGE_READWRITE, &mut old);
-                        std::slice::from_raw_parts(pages.0, 8192)
-                    };
+                        std::slice::from_raw_parts(pages.0, 8192).to_vec()
+                    }
+                };
+                let after = |pages: &Pages| {
+                    let there = reopen(pages);
                     assert_eq!(there[..4096], now[..4096], "{what}: the first page");
                     assert!(there[4096..].iter().all(|&b| b == 0), "{what}: stored in the second page");
                 };
@@ -1074,6 +1102,30 @@ mod tests {
                 // SAFETY: as above.
                 assert_eq!(unsafe { put(pages.0, was.as_ptr(), now.as_ptr(), blocks) }, 0, "{what}: put");
                 after(&pages);
+
+                if whole {
+                    continue;
+                }
+                // A block across the two pages, its first k dwords in the first.
+                for k in [1usize, 3, 7] {
+                    let what = format!("{what}, block across with {k} dwords before");
+                    let pages = Pages::new(2 << 12);
+                    second(&pages);
+                    let (was, new) = ([0u8; 32], [0x77u8; 32]);
+                    let from = 4096 - 4 * k;
+                    // SAFETY: as above; the block lies in our allocation.
+                    assert_eq!(unsafe { put(pages.0.add(from), was.as_ptr(), new.as_ptr(), 1) }, 0, "{what}: put");
+                    let there = reopen(&pages);
+                    assert!(there[..from].iter().all(|&b| b == 0), "{what}: stored before the block");
+                    assert!(there[4096..].iter().all(|&b| b == 0), "{what}: stored in the second page");
+                    for dword in there[from..4096].chunks(4) {
+                        if plain {
+                            assert_eq!(dword, [0x77; 4], "{what}: a dword before the fault not stored");
+                        } else {
+                            assert!(dword == [0; 4] || dword == [0x77; 4], "{what}: a dword half stored");
+                        }
+                    }
+                }
             }
         }
     }
