@@ -6,6 +6,9 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+// Most of the runtime is Windows-only; elsewhere its helpers go unused.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 pub mod bvh;
 pub mod dxbc;
 pub mod dxil;

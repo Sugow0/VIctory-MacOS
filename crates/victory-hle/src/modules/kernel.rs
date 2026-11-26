@@ -425,7 +425,15 @@ fn title_priority(asked: i32) -> i32 {
     }
 }
 
+/// [`title_priority`]; without a host (a build for another host than
+/// Windows) it fails.
+#[cfg(not(windows))]
+pub extern "system" fn SetThreadPriority(_: *mut c_void, _: i32) -> i32 {
+    0
+}
+
 /// [`title_priority`].
+#[cfg(windows)]
 pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
@@ -689,6 +697,12 @@ mod tests {
     fn no_title_thread_waits_for_idle_processors() {
         let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();
         assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
+    }
+
+    /// [`SetThreadPriority`] applies [`title_priority`] on the host thread.
+    #[cfg(windows)]
+    #[test]
+    fn title_thread_priorities_reach_the_host() {
         use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
         std::thread::spawn(|| {
             // SAFETY: plain calls on this thread.
@@ -701,6 +715,8 @@ mod tests {
         .unwrap();
     }
 
+    /// Needs Windows paths (`C:\\...` is not absolute elsewhere).
+    #[cfg(windows)]
     #[test]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
@@ -782,6 +798,8 @@ mod tests {
         );
     }
 
+    /// Needs Windows paths (file names split at `\\`).
+    #[cfg(windows)]
     #[test]
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;

@@ -15,6 +15,9 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// Most of the runtime is Windows-only; elsewhere its helpers go unused.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]

@@ -3,6 +3,9 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+// Most of the runtime is Windows-only; elsewhere its helpers go unused.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
