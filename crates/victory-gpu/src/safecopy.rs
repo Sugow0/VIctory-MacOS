@@ -10,6 +10,11 @@
 //! [`crate::watch`] (`on_write`, the first in the process), which opens a
 //! block we guard ourselves and lets the copy go on, and otherwise sends it
 //! to its failing exit. `VICTORY_SAFE_COPY=0`: through the kernel, as before.
+//!
+//! [`put_changed`] and [`merge`] store the dwords of a block that change as
+//! one masked store (`vpmaskmovd`), or one by one under Wine
+//! ([`plain_stores`], `VICTORY_SAFE_STORES`): Rosetta does not deliver a
+//! fault in a masked store, and the process hangs.
 
 use std::sync::OnceLock;
 
@@ -134,6 +139,166 @@ std::arch::global_asm!(
     "mov qword ptr [rax + 8], r11",
     "mov rax, r9",
     "ret",
+    ".globl victory_safe_put_plain",
+    ".globl victory_safe_put_plain_at",
+    ".globl victory_safe_put_plain_after",
+    // As victory_safe_put, the dwords stored one by one from a general
+    // register and not by one masked store (see [`plain_stores`]); a fault
+    // leaves through victory_safe_put_failed.
+    "victory_safe_put_plain:",
+    "test r9, r9",
+    "jz 4f",
+    "2:",
+    "vmovdqu ymm1, ymmword ptr [r8]",
+    "vpcmpeqd ymm2, ymm1, ymmword ptr [rdx]",
+    "vmovmskps eax, ymm2",
+    "xor eax, 255",
+    "jz 3f",
+    "vextracti128 xmm2, ymm1, 1",
+    "victory_safe_put_plain_at:",
+    "test al, 1",
+    "jz 20f",
+    "vmovd r10d, xmm1",
+    "mov dword ptr [rcx], r10d",
+    "20:",
+    "test al, 2",
+    "jz 21f",
+    "vpextrd r10d, xmm1, 1",
+    "mov dword ptr [rcx + 4], r10d",
+    "21:",
+    "test al, 4",
+    "jz 22f",
+    "vpextrd r10d, xmm1, 2",
+    "mov dword ptr [rcx + 8], r10d",
+    "22:",
+    "test al, 8",
+    "jz 23f",
+    "vpextrd r10d, xmm1, 3",
+    "mov dword ptr [rcx + 12], r10d",
+    "23:",
+    "test al, 16",
+    "jz 24f",
+    "vmovd r10d, xmm2",
+    "mov dword ptr [rcx + 16], r10d",
+    "24:",
+    "test al, 32",
+    "jz 25f",
+    "vpextrd r10d, xmm2, 1",
+    "mov dword ptr [rcx + 20], r10d",
+    "25:",
+    "test al, 64",
+    "jz 26f",
+    "vpextrd r10d, xmm2, 2",
+    "mov dword ptr [rcx + 24], r10d",
+    "26:",
+    "test al, 128",
+    "jz 27f",
+    "vpextrd r10d, xmm2, 3",
+    "mov dword ptr [rcx + 28], r10d",
+    "27:",
+    "victory_safe_put_plain_after:",
+    "3:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "vzeroupper",
+    "4:",
+    "mov eax, 1",
+    "ret",
+    ".globl victory_safe_merge_plain",
+    ".globl victory_safe_merge_plain_at",
+    ".globl victory_safe_merge_plain_after",
+    ".globl victory_safe_merge_plain_failed",
+    // As victory_safe_merge, the dwords of a block only partly stored one by
+    // one from a general register and not by one masked store (see
+    // [`plain_stores`]). That register is r10, kept meanwhile in xmm5, which
+    // the failing exit here gives back before the common one.
+    "victory_safe_merge_plain:",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "test r9, r9",
+    "jz 6f",
+    "2:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
+    "vpmovmskb eax, ymm1",
+    "cmp eax, -1",
+    "je 5f",
+    "vmovq xmm5, r10",
+    "victory_safe_merge_plain_at:",
+    "vmovdqu ymm2, ymmword ptr [rcx]",
+    "vpblendvb ymm3, ymm0, ymm2, ymm1",
+    "vpcmpeqd ymm4, ymm3, ymm2",
+    "vmovmskps eax, ymm4",
+    "xor eax, 255",
+    "jz 4f",
+    "cmp eax, 255",
+    "je 3f",
+    "vextracti128 xmm4, ymm3, 1",
+    "test al, 1",
+    "jz 20f",
+    "vmovd r10d, xmm3",
+    "mov dword ptr [rcx], r10d",
+    "20:",
+    "test al, 2",
+    "jz 21f",
+    "vpextrd r10d, xmm3, 1",
+    "mov dword ptr [rcx + 4], r10d",
+    "21:",
+    "test al, 4",
+    "jz 22f",
+    "vpextrd r10d, xmm3, 2",
+    "mov dword ptr [rcx + 8], r10d",
+    "22:",
+    "test al, 8",
+    "jz 23f",
+    "vpextrd r10d, xmm3, 3",
+    "mov dword ptr [rcx + 12], r10d",
+    "23:",
+    "test al, 16",
+    "jz 24f",
+    "vmovd r10d, xmm4",
+    "mov dword ptr [rcx + 16], r10d",
+    "24:",
+    "test al, 32",
+    "jz 25f",
+    "vpextrd r10d, xmm4, 1",
+    "mov dword ptr [rcx + 20], r10d",
+    "25:",
+    "test al, 64",
+    "jz 26f",
+    "vpextrd r10d, xmm4, 2",
+    "mov dword ptr [rcx + 24], r10d",
+    "26:",
+    "test al, 128",
+    "jz 27f",
+    "vpextrd r10d, xmm4, 3",
+    "mov dword ptr [rcx + 28], r10d",
+    "27:",
+    "vmovq r10, xmm5",
+    "jmp 7f",
+    "3:",
+    "vmovdqu ymmword ptr [rcx], ymm3",
+    "victory_safe_merge_plain_after:",
+    "7:",
+    "popcnt eax, eax",
+    "add r11, rax",
+    "4:",
+    "inc r10",
+    "vmovdqu ymmword ptr [r8], ymm0",
+    "5:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "6:",
+    "jmp victory_safe_merge_failed",
+    "victory_safe_merge_plain_failed:",
+    "vmovq r10, xmm5",
+    "jmp victory_safe_merge_failed",
     ".globl victory_safe_changed",
     ".globl victory_safe_changed_at",
     ".globl victory_safe_changed_after",
@@ -186,6 +351,13 @@ unsafe extern "system" {
     fn victory_safe_merge_at();
     fn victory_safe_merge_after();
     fn victory_safe_merge_failed();
+    fn victory_safe_put_plain(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32;
+    fn victory_safe_put_plain_at();
+    fn victory_safe_put_plain_after();
+    fn victory_safe_merge_plain(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge_plain_at();
+    fn victory_safe_merge_plain_after();
+    fn victory_safe_merge_plain_failed();
     fn victory_safe_changed(title: *const u8, seen: *mut u8, records: usize, bits: *mut u64) -> u32;
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
@@ -237,6 +409,7 @@ pub(crate) struct Merged {
 /// [`copy`]'s. The stretch lies in one page of 4 KiB of title memory. [`on`]
 /// must have been asked.
 pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+    let victory_safe_merge = if plain_stores() { victory_safe_merge_plain } else { victory_safe_merge };
     let mut out = Merged { there: true, ..Merged::default() };
     let mut at = 0;
     while at < len {
@@ -353,9 +526,10 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     let tail = head + blocks * 32;
     let mut all = true;
     if blocks > 0 {
+        let put = if plain_stores() { victory_safe_put_plain } else { victory_safe_put };
         // SAFETY: the two slices hold the blocks; the destination's faults
         // leave through the failing exit.
-        all &= unsafe { victory_safe_put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
+        all &= unsafe { put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
     }
     let single = |from: usize, to: usize| {
         let mut all = true;
@@ -374,6 +548,37 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     all &= single(0, head);
     all &= single(tail, n);
     all
+}
+
+/// Whether [`put_changed`] and [`merge`] store the dwords that change one by
+/// one, from a general register, and not as one masked store (`vpmaskmovd`).
+/// Under Rosetta (Wine on Apple silicon) a fault in a masked store is not
+/// delivered to our handler ("unexpectedly need to EmulateForward on a
+/// synchronous exception") and the process hangs; one in a plain store is.
+/// `VICTORY_SAFE_STORES=plain` or `=masked` chooses; by default plain under
+/// Wine (ntdll exports `wine_get_version`), masked elsewhere.
+fn plain_stores() -> bool {
+    static PLAIN: OnceLock<bool> = OnceLock::new();
+    *PLAIN.get_or_init(|| match std::env::var_os("VICTORY_SAFE_STORES") {
+        Some(v) if v == "plain" => true,
+        Some(v) if v == "masked" => false,
+        None => on_wine(),
+        Some(v) => {
+            let wine = on_wine();
+            tracing::warn!(value = ?v, wine, "VICTORY_SAFE_STORES: expected plain or masked; plain under Wine, masked elsewhere");
+            wine
+        }
+    })
+}
+
+/// Whether we run under Wine: its ntdll exports `wine_get_version`.
+fn on_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookups in ntdll, always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
 }
 
 /// Whether copies are made here and not by the kernel.
@@ -411,6 +616,14 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_put_at as *const () as usize, victory_safe_put_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_put_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_put_plain_at as *const () as usize, victory_safe_put_plain_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_put_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_merge_plain_at as *const () as usize, victory_safe_merge_plain_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_merge_plain_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_changed_at as *const () as usize, victory_safe_changed_after as *const () as usize);
     if (from..to).contains(&at) {
@@ -715,6 +928,209 @@ mod tests {
                 w.join().expect("no write was undone");
             }
         });
+    }
+
+    /// The stores one by one ([`plain_stores`]) leave title memory, what was
+    /// held and the counts as the masked ones do, on memory that is there
+    /// (a fault in a masked store would hang under Rosetta): bytes changed
+    /// here and there, whole blocks changed (stored whole), one block at a
+    /// time as [`merge`] does at the ends, and puts at an address that is a
+    /// dword's but no block's. Each shape comes with changes the title had
+    /// made already (nothing to store) and with new ones.
+    #[test]
+    fn plain_stores_do_what_masked_ones_do() {
+        let (a, b) = (Pages::new(1 << 12), Pages::new(1 << 12));
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..4000u32 {
+            let (shape, as_title) = (round % 4, (round / 4) % 2 == 0);
+            let title: Vec<u8> = (0..4096).map(|_| random() as u8).collect();
+            let mut was: Vec<u8> = (0..4096).map(|_| random() as u8).collect();
+            let mut now = was.clone();
+            for _ in 0..random() % 200 {
+                let i = random() as usize % 4096;
+                now[i] = if as_title { title[i] } else { random() as u8 };
+            }
+            let mut whole = Vec::new();
+            if shape == 1 {
+                // Whole blocks in which every dword changes.
+                for _ in 0..1 + random() % 40 {
+                    let block = random() as usize % 128 * 32;
+                    for i in block..block + 32 {
+                        was[i] = title[i];
+                        now[i] = !title[i];
+                    }
+                    whole.push(block);
+                }
+            }
+            // Where and how many blocks: all, one (as at a stretch's ends),
+            // or a put 4 bytes into the page.
+            let (from, blocks, at) = match shape {
+                2 => (random() as usize % 128 * 32, 1, 0),
+                3 => (0, 127, 4),
+                _ => (0, 128, 0),
+            };
+            let mut one = None;
+            if shape == 2 {
+                // A byte of the one block that is new to the title too.
+                let i = from + random() as usize % 32;
+                was[i] = title[i];
+                now[i] = !title[i];
+                one = Some(i);
+            }
+            let (mut held_a, mut held_b) = (was.clone(), was.clone());
+            let (mut counts_a, mut counts_b) = ([0u64; 2], [0u64; 2]);
+            // SAFETY: our allocations and vectors, 4096 bytes each; every
+            // call stays inside them.
+            unsafe {
+                std::ptr::copy_nonoverlapping(title.as_ptr(), a.0, 4096);
+                std::ptr::copy_nonoverlapping(title.as_ptr(), b.0, 4096);
+                let (now_at, held_a_at, held_b_at) = (now.as_ptr().add(from), held_a.as_mut_ptr().add(from), held_b.as_mut_ptr().add(from));
+                assert_eq!(victory_safe_merge(a.0.add(from), now_at, held_a_at, blocks, &mut counts_a), 0);
+                assert_eq!(victory_safe_merge_plain(b.0.add(from), now_at, held_b_at, blocks, &mut counts_b), 0);
+                let there = std::slice::from_raw_parts(a.0, 4096);
+                assert_eq!(there, std::slice::from_raw_parts(b.0, 4096), "merge, round {round}");
+                assert_eq!((&held_a, counts_a), (&held_b, counts_b), "merge, round {round}");
+                for &block in &whole {
+                    assert_eq!(there[block..block + 32], now[block..block + 32], "round {round}: whole block {block}");
+                }
+                if let Some(i) = one {
+                    assert!(counts_a[1] > 0, "round {round}: the 1-block merge stored nothing");
+                    assert_eq!(there[i], now[i], "round {round}: the 1-block merge's new byte {i}");
+                }
+                std::ptr::copy_nonoverlapping(title.as_ptr(), a.0, 4096);
+                std::ptr::copy_nonoverlapping(title.as_ptr(), b.0, 4096);
+                let (put_blocks, from) = if at == 0 { (blocks, from) } else { (127, 0) };
+                let (was_at, now_at) = (was.as_ptr().add(from), now.as_ptr().add(from));
+                assert_ne!(victory_safe_put(a.0.add(from + at), was_at, now_at, put_blocks), 0);
+                assert_ne!(victory_safe_put_plain(b.0.add(from + at), was_at, now_at, put_blocks), 0);
+                assert_eq!(std::slice::from_raw_parts(a.0, 4096), std::slice::from_raw_parts(b.0, 4096), "put, round {round}");
+            }
+        }
+    }
+
+    /// The stores one by one ([`plain_stores`]), called as such: where the
+    /// second of two pages is missing, read-only or a guard page, a merge
+    /// leaves with the blocks of the second page left, its counts those of
+    /// the first (r10, used for the stores, given back), what it held of
+    /// the second page as it was; a put fails; nothing of the second page is
+    /// stored and a guard page stays one. The faults: the read of title
+    /// memory (missing, guarded), a dword stored alone (read-only) and a
+    /// whole block stored (read-only, all its dwords changed); a guard page
+    /// cannot fault a merge's store, as the merge reads the block first.
+    /// A put of a block across the two pages stores, one by one, the dwords
+    /// in the first page (they come before the fault), and fails. Not under
+    /// Wine, the masked stores are held to the same, but for that block:
+    /// whether a masked store that faults stores some of its dwords is the
+    /// processor's, so there each dword of the first page is either as it
+    /// was or new ([`put_changed`]: "then some may have been").
+    #[test]
+    fn plain_stores_fail_where_title_memory_is_not_there() {
+        assert!(on());
+        let masked = !on_wine();
+        for (how, whole) in [("missing", false), ("read-only", false), ("read-only", true), ("guarded", false), ("guarded", true)] {
+            for plain in [true, false] {
+                if !plain && !masked {
+                    continue;
+                }
+                let what = format!("{how}, whole {whole}, plain {plain}");
+                let blocks = 2 * 4096 / 32;
+                // One dword changed in each block, or in the second page's
+                // first block all of them.
+                let mut now = vec![0u8; 8192];
+                for block in 0..blocks {
+                    now[block * 32] = 1;
+                }
+                if whole {
+                    now[4096..4128].fill(0x5A);
+                }
+                let second = |pages: &Pages| {
+                    let mut old = 0;
+                    // SAFETY: the second page of our allocation.
+                    unsafe {
+                        match how {
+                            "missing" => VirtualFree(pages.0.add(4096).cast(), 4096, MEM_DECOMMIT),
+                            "read-only" => VirtualProtect(pages.0.add(4096).cast(), 4096, PAGE_READONLY, &mut old),
+                            _ => VirtualProtect(pages.0.add(4096).cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old),
+                        }
+                    };
+                };
+                // The two pages once the call is over: a guard page must
+                // still be one; then the second is made readable again.
+                // A missing page comes back committed, so zero-filled: that
+                // nothing was stored in it cannot fail there (nothing could
+                // be), it is proven by the other two.
+                let reopen = |pages: &Pages| -> Vec<u8> {
+                    let at = pages.0.addr() + 4096;
+                    if how == "guarded" {
+                        assert!(guarded(at), "{what}: the guard flag was consumed");
+                    }
+                    let mut old = 0;
+                    // SAFETY: as above; then the pages can be read.
+                    unsafe {
+                        VirtualAlloc(at as *mut _, 4096, MEM_COMMIT, PAGE_READWRITE);
+                        VirtualProtect(at as *mut _, 4096, PAGE_READWRITE, &mut old);
+                        std::slice::from_raw_parts(pages.0, 8192).to_vec()
+                    }
+                };
+                let after = |pages: &Pages| {
+                    let there = reopen(pages);
+                    assert_eq!(there[..4096], now[..4096], "{what}: the first page");
+                    assert!(there[4096..].iter().all(|&b| b == 0), "{what}: stored in the second page");
+                };
+
+                let pages = Pages::new(2 << 12);
+                second(&pages);
+                let mut held = vec![0u8; 8192];
+                let mut counts = [0u64; 2];
+                let merge = if plain { victory_safe_merge_plain } else { victory_safe_merge };
+                // SAFETY: our allocation, whose faults leave through the
+                // failing exits, and our vectors.
+                let left = unsafe { merge(pages.0, now.as_ptr(), held.as_mut_ptr(), blocks, &mut counts) };
+                assert_eq!(left, blocks / 2, "{what}: merge");
+                assert_eq!(counts, [128, 128], "{what}: merge's counts");
+                assert_eq!(held[..4096], now[..4096], "{what}: held");
+                assert!(held[4096..].iter().all(|&b| b == 0), "{what}: held of the second page");
+                after(&pages);
+
+                let pages = Pages::new(2 << 12);
+                second(&pages);
+                let was = vec![0u8; 8192];
+                let put = if plain { victory_safe_put_plain } else { victory_safe_put };
+                // SAFETY: as above.
+                assert_eq!(unsafe { put(pages.0, was.as_ptr(), now.as_ptr(), blocks) }, 0, "{what}: put");
+                after(&pages);
+
+                if whole {
+                    continue;
+                }
+                // A block across the two pages, its first k dwords in the first.
+                for k in [1usize, 3, 7] {
+                    let what = format!("{what}, block across with {k} dwords before");
+                    let pages = Pages::new(2 << 12);
+                    second(&pages);
+                    let (was, new) = ([0u8; 32], [0x77u8; 32]);
+                    let from = 4096 - 4 * k;
+                    // SAFETY: as above; the block lies in our allocation.
+                    assert_eq!(unsafe { put(pages.0.add(from), was.as_ptr(), new.as_ptr(), 1) }, 0, "{what}: put");
+                    let there = reopen(&pages);
+                    assert!(there[..from].iter().all(|&b| b == 0), "{what}: stored before the block");
+                    assert!(there[4096..].iter().all(|&b| b == 0), "{what}: stored in the second page");
+                    for dword in there[from..4096].chunks(4) {
+                        if plain {
+                            assert_eq!(dword, [0x77; 4], "{what}: a dword before the fault not stored");
+                        } else {
+                            assert!(dword == [0; 4] || dword == [0x77; 4], "{what}: a dword half stored");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
