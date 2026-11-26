@@ -88,8 +88,8 @@ pub(crate) fn on() -> bool {
     file().is_some()
 }
 
-const RS_EXPOSURE: &str = "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), DescriptorTable(SRV(t1)), UAV(u0), UAV(u1), UAV(u2)";
-const RS_LUX: &str = "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u3)), UAV(u0)";
+pub(crate) const RS_EXPOSURE: &str = "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), DescriptorTable(SRV(t1)), UAV(u0), UAV(u1), UAV(u2)";
+pub(crate) const RS_LUX: &str = "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u3)), UAV(u0)";
 
 /// Dwords a record; records in the ring.
 const RECORD: u64 = 64;

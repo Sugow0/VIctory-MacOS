@@ -4,6 +4,10 @@
 //! write none: Wine's `d3dcompiler_47` ignores the attribute. Then the same
 //! string is read here and serialized with `D3D12SerializeVersionedRootSignature`
 //! (version 1.1, as the compiler's). Bytecode that has its part is used as is.
+//!
+//! The string is read from the first line of the source that starts with
+//! `#define RS` (spaces or tabs between the words): it must be one quoted
+//! string on that line, with no line continuation.
 
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -19,17 +23,25 @@ pub(crate) fn root_signature(
     code: &[u8],
     source: &str,
 ) -> Result<ID3D12RootSignature> {
-    if has_part(code, *b"RTS0") {
+    let Some(blob) = fallback(code, source)? else {
         // SAFETY: the bytes live through the call.
         return unsafe { device.CreateRootSignature(0, code) };
-    }
-    let blob = serialize(defined(source).ok_or_else(|| unread("no #define RS"))?)?;
+    };
     // SAFETY: the blob's own bytes, alive through the call.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         device.CreateRootSignature(0, bytes)
     }
+}
+
+/// The root signature serialized from `source`'s string when `code` has none
+/// of its own; `None` when it has one.
+fn fallback(code: &[u8], source: &str) -> Result<Option<ID3DBlob>> {
+    if has_part(code, *b"RTS0") {
+        return Ok(None);
+    }
+    serialize(defined(source).ok_or_else(|| unread("no #define RS"))?).map(Some)
 }
 
 /// Whether the DXBC container `code` has a part named `fourcc`.
@@ -42,15 +54,25 @@ fn has_part(code: &[u8], fourcc: [u8; 4]) -> bool {
         return false;
     }
     let Some(count) = word(28) else { return false };
+    // Each part has its offset after the 32 bytes of the header.
+    if count > code.len().saturating_sub(32) / 4 {
+        return false;
+    }
     (0..count).any(|i| word(32 + 4 * i).is_some_and(|at| code.get(at..at + 4) == Some(&fourcc[..])))
 }
 
 /// The string `source` defines as `RS`.
 fn defined(source: &str) -> Option<&str> {
+    // `word` and what follows it, if whitespace follows it.
+    fn after<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+        let rest = text.strip_prefix(word)?;
+        rest.starts_with(char::is_whitespace)
+            .then(|| rest.trim_start())
+    }
     let line = source
         .lines()
-        .find_map(|l| l.trim_start().strip_prefix("#define RS "))?;
-    line.trim().strip_prefix('"')?.strip_suffix('"')
+        .find_map(|l| after(after(l.trim_start(), "#define")?, "RS"))?;
+    line.trim_end().strip_prefix('"')?.strip_suffix('"')
 }
 
 fn unread(what: &str) -> Error {
@@ -154,8 +176,28 @@ fn number(text: &str) -> Result<u32> {
 
 /// A register such as `t3`: its letter and number.
 fn register(text: &str) -> Result<(char, u32)> {
-    let letter = text.chars().next().ok_or_else(|| unread(text))?;
-    Ok((letter.to_ascii_lowercase(), number(&text[1..])?))
+    let mut chars = text.chars();
+    let letter = chars.next().ok_or_else(|| unread(text))?;
+    Ok((letter.to_ascii_lowercase(), number(chars.as_str())?))
+}
+
+/// The key of an argument (`register` for a plain one), refused if `seen`
+/// already holds it.
+fn once<'a>(seen: &mut Vec<&'a str>, argument: &'a str) -> Result<()> {
+    let key = keyed(argument).map_or("register", |(k, _)| k);
+    if seen.contains(&key) {
+        return Err(unread(argument));
+    }
+    seen.push(key);
+    Ok(())
+}
+
+/// Refuses `item` unless `seen` holds every key of `needed`.
+fn needs(seen: &[&str], needed: &[&str], item: &str) -> Result<()> {
+    match needed.iter().all(|n| seen.contains(n)) {
+        true => Ok(()),
+        false => Err(unread(item)),
+    }
 }
 
 /// `A|B|C`, each name looked up in `names`; `0` is none.
@@ -250,14 +292,17 @@ fn parse(text: &str) -> Result<Read> {
         samplers: Vec::new(),
         flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
     };
+    let mut rooted = false;
     for item in split(text) {
         let (name, arguments) = call(item)?;
         let mut ranges = Vec::new();
         let parameter = match name {
             "RootFlags" => {
-                for a in &arguments {
-                    read.flags.0 |= flags(a, ROOT_FLAGS)?;
-                }
+                let ([a], false) = (&arguments[..], rooted) else {
+                    return Err(unread(item));
+                };
+                read.flags.0 = flags(a, ROOT_FLAGS)?;
+                rooted = true;
                 continue;
             }
             "StaticSampler" => {
@@ -267,13 +312,18 @@ fn parse(text: &str) -> Result<Read> {
             "RootConstants" => constants(&arguments)?,
             "CBV" | "SRV" | "UAV" => descriptor(name, &arguments)?,
             "DescriptorTable" => {
-                let mut shown = D3D12_SHADER_VISIBILITY_ALL;
+                let mut shown = None;
                 for a in &arguments {
                     match keyed(a) {
-                        Some(("visibility", v)) if !a.contains('(') => shown = visibility(v)?,
+                        Some(("visibility", v)) if !a.contains('(') => {
+                            if shown.replace(visibility(v)?).is_some() {
+                                return Err(unread(a));
+                            }
+                        }
                         _ => ranges.push(range(a)?),
                     }
                 }
+                let shown = shown.unwrap_or(D3D12_SHADER_VISIBILITY_ALL);
                 D3D12_ROOT_PARAMETER1 {
                     ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                     ShaderVisibility: shown,
@@ -291,7 +341,9 @@ fn parse(text: &str) -> Result<Read> {
 fn constants(arguments: &[&str]) -> Result<D3D12_ROOT_PARAMETER1> {
     let mut c = D3D12_ROOT_CONSTANTS::default();
     let mut shown = D3D12_SHADER_VISIBILITY_ALL;
+    let mut seen = Vec::new();
     for a in arguments {
+        once(&mut seen, a)?;
         match keyed(a) {
             Some(("num32BitConstants", v)) => c.Num32BitValues = number(v)?,
             Some(("space", v)) => c.RegisterSpace = number(v)?,
@@ -300,6 +352,7 @@ fn constants(arguments: &[&str]) -> Result<D3D12_ROOT_PARAMETER1> {
             _ => return Err(unread(a)),
         }
     }
+    needs(&seen, &["register", "num32BitConstants"], "RootConstants")?;
     Ok(D3D12_ROOT_PARAMETER1 {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
         Anonymous: D3D12_ROOT_PARAMETER1_0 { Constants: c },
@@ -320,7 +373,9 @@ fn letter(kind: &str) -> char {
 fn descriptor(kind: &str, arguments: &[&str]) -> Result<D3D12_ROOT_PARAMETER1> {
     let mut d = D3D12_ROOT_DESCRIPTOR1::default();
     let mut shown = D3D12_SHADER_VISIBILITY_ALL;
+    let mut seen = Vec::new();
     for a in arguments {
+        once(&mut seen, a)?;
         match keyed(a) {
             Some(("space", v)) => d.RegisterSpace = number(v)?,
             Some(("visibility", v)) => shown = visibility(v)?,
@@ -329,6 +384,7 @@ fn descriptor(kind: &str, arguments: &[&str]) -> Result<D3D12_ROOT_PARAMETER1> {
             _ => return Err(unread(a)),
         }
     }
+    needs(&seen, &["register"], kind)?;
     let kind = match kind {
         "CBV" => D3D12_ROOT_PARAMETER_TYPE_CBV,
         "SRV" => D3D12_ROOT_PARAMETER_TYPE_SRV,
@@ -355,7 +411,9 @@ fn range(item: &str) -> Result<D3D12_DESCRIPTOR_RANGE1> {
         OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
         ..Default::default()
     };
+    let mut seen = Vec::new();
     for a in &arguments {
+        once(&mut seen, a)?;
         match keyed(a) {
             Some(("numDescriptors", "unbounded")) => r.NumDescriptors = u32::MAX,
             Some(("numDescriptors", v)) => r.NumDescriptors = number(v)?,
@@ -367,6 +425,7 @@ fn range(item: &str) -> Result<D3D12_DESCRIPTOR_RANGE1> {
             _ => return Err(unread(a)),
         }
     }
+    needs(&seen, &["register"], item)?;
     Ok(r)
 }
 
@@ -397,7 +456,9 @@ fn sampler(arguments: &[&str]) -> Result<D3D12_STATIC_SAMPLER_DESC> {
             _ => return Err(unread(v)),
         })
     };
+    let mut seen = Vec::new();
     for a in arguments {
+        once(&mut seen, a)?;
         match keyed(a) {
             Some(("filter", v)) => {
                 s.Filter = match v {
@@ -418,6 +479,7 @@ fn sampler(arguments: &[&str]) -> Result<D3D12_STATIC_SAMPLER_DESC> {
             _ => return Err(unread(a)),
         }
     }
+    needs(&seen, &["register"], "StaticSampler")?;
     Ok(s)
 }
 
@@ -426,28 +488,174 @@ mod tests {
     use super::*;
     use windows::core::Interface;
 
-    /// Every kind of piece our shaders' strings hold.
-    const STRINGS: &[&str] = &[
-        "RootFlags(0)",
-        "UAV(u0)",
-        "RootConstants(num32BitConstants = 1, b0)",
-        "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)",
-        "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)",
-        "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)",
-        "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)",
-        "RootConstants(num32BitConstants=4,b0), DescriptorTable(SRV(t0,numDescriptors=8)), UAV(u0), DescriptorTable(CBV(b1,numDescriptors=8))",
-        "RootConstants(num32BitConstants=4,b0), DescriptorTable(SRV(t0,numDescriptors=4),CBV(b1)), UAV(u0), StaticSampler(s0,filter=FILTER_MIN_MAG_MIP_LINEAR,addressU=TEXTURE_ADDRESS_WRAP,addressV=TEXTURE_ADDRESS_WRAP)",
-        "DescriptorTable(SRV(t0,numDescriptors=64,flags=DESCRIPTORS_VOLATILE|DATA_VOLATILE)), UAV(u0)",
-        "DescriptorTable(SRV(t0, numDescriptors = 2)), UAV(u0), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_POINT)",
+    /// The files whose shaders declare `#define RS`, as compiled in.
+    const FILES: &[(&str, &str)] = &[
+        ("ambient.rs", include_str!("../ambient.rs")),
+        ("compose.rs", include_str!("../compose.rs")),
+        ("host.rs", include_str!("../host.rs")),
+        ("host/awake.rs", include_str!("awake.rs")),
+        ("host/send.rs", include_str!("send.rs")),
+        ("host/upcheck.rs", include_str!("upcheck.rs")),
+        ("indirect.rs", include_str!("../indirect.rs")),
+        ("indirect/batch.rs", include_str!("../indirect/batch.rs")),
+        ("indirect/bench.rs", include_str!("../indirect/bench.rs")),
+        ("inplace.rs", include_str!("../inplace.rs")),
+        ("lightprobe.rs", include_str!("../lightprobe.rs")),
+        (
+            "replay/play/merge.rs",
+            include_str!("../replay/play/merge.rs"),
+        ),
+        ("resource.rs", include_str!("../resource.rs")),
+        ("tiles.rs", include_str!("../tiles.rs")),
     ];
 
-    /// What a deserialized 1.1 description says, in words; a flag left at
-    /// none is written as the default it stands for.
-    fn words(desc: &D3D12_ROOT_SIGNATURE_DESC1) -> Vec<String> {
-        let mut out = vec![format!("flags {}", desc.Flags.0)];
-        // SAFETY: the deserializer's arrays, of the counts it gives.
+    /// Every `#define RS` string of `text`, a Rust file: in raw strings as
+    /// written, in plain ones unescaped. The template `{rs}` (lightprobe's,
+    /// whose strings are its constants) is left out.
+    fn strings_in(text: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for line in text.lines().filter(|l| l.contains("#define RS")) {
+            let unescaped = line.replace("\\\"", "\"").replace("\\n", "\n");
+            for part in unescaped.lines() {
+                let Some(at) = part.find("#define RS") else {
+                    continue;
+                };
+                let string = defined(&part[at..]).unwrap_or_else(|| panic!("unread: {line}"));
+                if string != "{rs}" {
+                    found.push(string.to_owned());
+                }
+            }
+        }
+        found
+    }
+
+    /// Every root signature string of the crate's shaders.
+    fn our_strings() -> Vec<(&'static str, String)> {
+        let mut all = Vec::new();
+        for (file, text) in FILES {
+            let found = strings_in(text);
+            // lightprobe's strings are its constants, below.
+            let templated = text.contains(r#"#define RS \"{rs}\""#);
+            assert!(
+                !found.is_empty() || templated,
+                "{file} declares no root signature any more"
+            );
+            all.extend(found.into_iter().map(|s| (*file, s)));
+        }
+        for rs in [crate::lightprobe::RS_EXPOSURE, crate::lightprobe::RS_LUX] {
+            all.push(("lightprobe.rs", rs.to_owned()));
+        }
+        all
+    }
+
+    /// `text` in a compute shader of nothing that declares it.
+    fn shader(text: &str) -> String {
+        format!(
+            "#define RS \"{text}\"\n[RootSignature(RS)]\n[numthreads(1, 1, 1)]\nvoid main() {{}}\n"
+        )
+    }
+
+    fn bytes(blob: &ID3DBlob) -> &[u8] {
+        // SAFETY: the blob's own bytes, borrowed with it.
         unsafe {
-            for p in std::slice::from_raw_parts(desc.pParameters, desc.NumParameters as usize) {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        }
+    }
+
+    /// The default a range's flags of none stand for in version 1.1.
+    fn range_flags(flags: i32, kind: D3D12_DESCRIPTOR_RANGE_TYPE) -> i32 {
+        match (flags, kind) {
+            (0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV) => D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE.0,
+            (0, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) => 0,
+            (0, _) => D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE.0,
+            (f, _) => f,
+        }
+    }
+
+    /// The default a root descriptor's flags of none stand for in 1.1.
+    fn descriptor_flags(flags: i32, kind: D3D12_ROOT_PARAMETER_TYPE) -> i32 {
+        match (flags, kind) {
+            (0, D3D12_ROOT_PARAMETER_TYPE_UAV) => D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE.0,
+            (0, _) => D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE.0,
+            (f, _) => f,
+        }
+    }
+
+    fn sampler_words(s: &D3D12_STATIC_SAMPLER_DESC) -> String {
+        format!(
+            "sampler {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            s.Filter.0,
+            s.AddressU.0,
+            s.AddressV.0,
+            s.AddressW.0,
+            s.MipLODBias,
+            s.MaxAnisotropy,
+            s.ComparisonFunc.0,
+            s.BorderColor.0,
+            s.MinLOD,
+            s.MaxLOD,
+            s.ShaderRegister,
+            s.RegisterSpace,
+            s.ShaderVisibility.0
+        )
+    }
+
+    /// What a description of either version says, in words: version 1.0
+    /// has no range or descriptor flags; in 1.1 a flag left at none is
+    /// written as the default it stands for.
+    fn words(desc: &D3D12_VERSIONED_ROOT_SIGNATURE_DESC) -> Vec<String> {
+        let mut out = vec![format!("version {}", desc.Version.0)];
+        // SAFETY: the deserializer's arrays, of the counts it gives, read
+        // as the version it gives.
+        unsafe {
+            if desc.Version == D3D_ROOT_SIGNATURE_VERSION_1_0 {
+                let d = &desc.Anonymous.Desc_1_0;
+                out.push(format!("flags {}", d.Flags.0));
+                for p in std::slice::from_raw_parts(d.pParameters, d.NumParameters as usize) {
+                    let shown = p.ShaderVisibility.0;
+                    match p.ParameterType {
+                        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => {
+                            let t = p.Anonymous.DescriptorTable;
+                            out.push(format!("table {shown}"));
+                            for r in std::slice::from_raw_parts(
+                                t.pDescriptorRanges,
+                                t.NumDescriptorRanges as usize,
+                            ) {
+                                out.push(format!(
+                                    "  range {} {} {} {} {}",
+                                    r.RangeType.0,
+                                    r.NumDescriptors,
+                                    r.BaseShaderRegister,
+                                    r.RegisterSpace,
+                                    r.OffsetInDescriptorsFromTableStart
+                                ));
+                            }
+                        }
+                        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => {
+                            let c = p.Anonymous.Constants;
+                            out.push(format!(
+                                "constants {shown} {} {} {}",
+                                c.ShaderRegister, c.RegisterSpace, c.Num32BitValues
+                            ));
+                        }
+                        kind => {
+                            let r = p.Anonymous.Descriptor;
+                            out.push(format!(
+                                "descriptor {} {shown} {} {}",
+                                kind.0, r.ShaderRegister, r.RegisterSpace
+                            ));
+                        }
+                    }
+                }
+                for s in std::slice::from_raw_parts(d.pStaticSamplers, d.NumStaticSamplers as usize)
+                {
+                    out.push(sampler_words(s));
+                }
+                return out;
+            }
+            let d = &desc.Anonymous.Desc_1_1;
+            out.push(format!("flags {}", d.Flags.0));
+            for p in std::slice::from_raw_parts(d.pParameters, d.NumParameters as usize) {
                 let shown = p.ShaderVisibility.0;
                 match p.ParameterType {
                     D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => {
@@ -457,23 +665,14 @@ mod tests {
                             t.pDescriptorRanges,
                             t.NumDescriptorRanges as usize,
                         ) {
-                            let flags = match (r.Flags.0, r.RangeType) {
-                                (0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV) => {
-                                    D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE.0
-                                }
-                                (0, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) => 0,
-                                (0, _) => {
-                                    D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE.0
-                                }
-                                (f, _) => f,
-                            };
                             out.push(format!(
-                                "  range {} {} {} {} {} {flags}",
+                                "  range {} {} {} {} {} {}",
                                 r.RangeType.0,
                                 r.NumDescriptors,
                                 r.BaseShaderRegister,
                                 r.RegisterSpace,
-                                r.OffsetInDescriptorsFromTableStart
+                                r.OffsetInDescriptorsFromTableStart,
+                                range_flags(r.Flags.0, r.RangeType)
                             ));
                         }
                     }
@@ -485,51 +684,28 @@ mod tests {
                         ));
                     }
                     kind => {
-                        let d = p.Anonymous.Descriptor;
-                        let flags = match (d.Flags.0, kind) {
-                            (0, D3D12_ROOT_PARAMETER_TYPE_UAV) => {
-                                D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE.0
-                            }
-                            (0, _) => D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE.0,
-                            (f, _) => f,
-                        };
+                        let r = p.Anonymous.Descriptor;
                         out.push(format!(
-                            "descriptor {} {shown} {} {} {flags}",
-                            kind.0, d.ShaderRegister, d.RegisterSpace
+                            "descriptor {} {shown} {} {} {}",
+                            kind.0,
+                            r.ShaderRegister,
+                            r.RegisterSpace,
+                            descriptor_flags(r.Flags.0, kind)
                         ));
                     }
                 }
             }
-            for s in
-                std::slice::from_raw_parts(desc.pStaticSamplers, desc.NumStaticSamplers as usize)
-            {
-                out.push(format!(
-                    "sampler {} {} {} {} {} {} {} {} {} {} {} {} {}",
-                    s.Filter.0,
-                    s.AddressU.0,
-                    s.AddressV.0,
-                    s.AddressW.0,
-                    s.MipLODBias,
-                    s.MaxAnisotropy,
-                    s.ComparisonFunc.0,
-                    s.BorderColor.0,
-                    s.MinLOD,
-                    s.MaxLOD,
-                    s.ShaderRegister,
-                    s.RegisterSpace,
-                    s.ShaderVisibility.0
-                ));
+            for s in std::slice::from_raw_parts(d.pStaticSamplers, d.NumStaticSamplers as usize) {
+                out.push(sampler_words(s));
             }
         }
         out
     }
 
-    /// `bytes`' root signature, deserialized as version 1.1, in words.
-    fn deserialized(bytes: &[u8]) -> Vec<String> {
-        // SAFETY: the bytes live through the calls; the description is the
-        // deserializer's, read while it lives.
+    fn deserializer(bytes: &[u8]) -> ID3D12VersionedRootSignatureDeserializer {
+        let mut d: Option<ID3D12VersionedRootSignatureDeserializer> = None;
+        // SAFETY: the bytes live through the call; the out pointer is ours.
         unsafe {
-            let mut d: Option<ID3D12VersionedRootSignatureDeserializer> = None;
             D3D12CreateVersionedRootSignatureDeserializer(
                 bytes.as_ptr().cast(),
                 bytes.len(),
@@ -537,42 +713,131 @@ mod tests {
                 (&raw mut d).cast(),
             )
             .unwrap();
-            let d = d.unwrap();
-            let desc = &*d
-                .GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1)
-                .unwrap();
-            words(&desc.Anonymous.Desc_1_1)
+        }
+        d.unwrap()
+    }
+
+    /// The compiler's root signature (`theirs`, as it wrote it) and ours at
+    /// the version the compiler wrote, in words.
+    fn compared(theirs: &[u8], ours: &[u8]) -> (Vec<String>, Vec<String>) {
+        let (theirs, ours) = (deserializer(theirs), deserializer(ours));
+        // SAFETY: the descriptions are the deserializers', read while they live.
+        unsafe {
+            let theirs = &*theirs.GetUnconvertedRootSignatureDesc();
+            let at_theirs = &*ours.GetRootSignatureDescAtVersion(theirs.Version).unwrap();
+            (words(theirs), words(at_theirs))
         }
     }
 
-    /// Each string serializes, gives a root signature the device takes, and,
-    /// where the system's compiler writes its own (`RTS0`), the same one.
+    /// Every string of our shaders is read, serialized, and taken by the
+    /// device, both by itself and as the root signature of a shader compiled
+    /// with it (from its `RTS0`, or else ours).
     #[test]
-    fn our_strings_serialize_as_the_compiler_writes_them() {
+    fn every_string_of_ours_is_read() {
         use windows::core::s;
         let host = crate::host::host().expect("a device");
-        for text in STRINGS {
-            let blob = serialize(text).unwrap_or_else(|e| panic!("{text}: {e}"));
-            // SAFETY: the blob's own bytes.
-            let ours = unsafe {
-                std::slice::from_raw_parts(
-                    blob.GetBufferPointer().cast::<u8>(),
-                    blob.GetBufferSize(),
-                )
-            };
+        let all = our_strings();
+        for (file, text) in &all {
+            let blob = serialize(text).unwrap_or_else(|e| panic!("{file}: {text}: {e}"));
             // SAFETY: the bytes live through the call.
             let made: Result<ID3D12RootSignature> =
-                unsafe { host.device.CreateRootSignature(0, ours) };
-            made.unwrap_or_else(|e| panic!("{text}: {e}"));
-            let source = format!(
-                "#define RS \"{text}\"\n[RootSignature(RS)]\n[numthreads(1, 1, 1)]\nvoid main() {{}}\n"
-            );
-            assert_eq!(defined(&source), Some(*text));
+                unsafe { host.device.CreateRootSignature(0, bytes(&blob)) };
+            made.unwrap_or_else(|e| panic!("{file}: {text}: {e}"));
+            let source = shader(text);
+            assert_eq!(defined(&source), Some(text.as_str()));
             let code = crate::host::compile(&source, s!("main"), s!("cs_5_1")).unwrap();
-            root_signature(&host.device, &code, &source).unwrap_or_else(|e| panic!("{text}: {e}"));
-            if has_part(&code, *b"RTS0") {
-                assert_eq!(deserialized(ours), deserialized(&code), "{text}");
+            root_signature(&host.device, &code, &source)
+                .unwrap_or_else(|e| panic!("{file}: {text}: {e}"));
+        }
+        eprintln!("{} root signature strings read", all.len());
+        // Where the sources are at hand, no file is left out of FILES.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root.clone()];
+        let mut walked = false;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            walked = true;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                if name != "host/rootsig.rs" && text.contains("#define RS") {
+                    assert!(
+                        FILES.iter().any(|(f, _)| *f == name),
+                        "{name} is not in FILES"
+                    );
+                }
             }
+        }
+        if !walked {
+            eprintln!("skipped source walk: {} not readable", root.display());
+        }
+    }
+
+    /// Where the system's compiler writes its own root signature (`RTS0`),
+    /// the fallback, given the same shader with that part stripped, makes
+    /// the same one, and the stripped shader takes it.
+    #[test]
+    fn the_fallback_equals_the_compilers_own() {
+        use windows::Win32::Graphics::Direct3D::Fxc::{
+            D3DCOMPILER_STRIP_ROOT_SIGNATURE, D3DStripShader,
+        };
+        use windows::core::s;
+        let host = crate::host::host().expect("a device");
+        let all = our_strings();
+        let mut skipped = 0;
+        for (file, text) in &all {
+            let source = shader(text);
+            let code = crate::host::compile(&source, s!("main"), s!("cs_5_1")).unwrap();
+            if !has_part(&code, *b"RTS0") {
+                skipped += 1;
+                continue;
+            }
+            assert!(
+                fallback(&code, &source).unwrap().is_none(),
+                "{file}: {text}"
+            );
+            // SAFETY: the bytes live through the call.
+            let stripped = unsafe {
+                D3DStripShader(
+                    code.as_ptr().cast(),
+                    code.len(),
+                    D3DCOMPILER_STRIP_ROOT_SIGNATURE.0 as u32,
+                )
+            }
+            .unwrap();
+            let stripped = bytes(&stripped);
+            assert!(!has_part(stripped, *b"RTS0"), "{file}: {text}");
+            let ours = fallback(stripped, &source).unwrap().expect("no RTS0 left");
+            let (theirs, ours_words) = compared(&code, bytes(&ours));
+            assert_eq!(theirs, ours_words, "{file}: {text}");
+            let root = root_signature(&host.device, stripped, &source).unwrap();
+            // SAFETY: the description points at live data.
+            let pso: Result<ID3D12PipelineState> = unsafe {
+                host.device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: stripped.as_ptr().cast(),
+                            BytecodeLength: stripped.len(),
+                        },
+                        ..Default::default()
+                    })
+            };
+            pso.unwrap_or_else(|e| panic!("{file}: {text}: {e}"));
+        }
+        if skipped > 0 {
+            eprintln!("skipped compare: no RTS0 ({skipped} of {})", all.len());
         }
     }
 
@@ -587,10 +852,27 @@ mod tests {
             "StaticSampler(s0, filter=FILTER_NONE_AT_ALL)",
             "RootFlags(ALLOW_NOTHING)",
             "UAV(u0",
+            "UAV()",
+            "UAV(space=1)",
+            "UAV(u0, u1)",
+            "UAV(u0, space=1, space=2)",
+            "UAV(\u{e9}0)",
+            "RootConstants(b0)",
+            "RootConstants(num32BitConstants=1)",
+            "RootConstants(num32BitConstants=1, num32BitConstants=2, b0)",
+            "DescriptorTable(SRV(numDescriptors=2))",
+            "DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_PIXEL, visibility=SHADER_VISIBILITY_ALL)",
+            "StaticSampler(filter=FILTER_MIN_MAG_MIP_POINT)",
+            "StaticSampler(s0, addressU=TEXTURE_ADDRESS_WRAP, addressU=TEXTURE_ADDRESS_CLAMP)",
+            "RootFlags(0), RootFlags(0)",
+            "RootFlags(0, 0)",
         ] {
             assert_eq!(parse(text).err().map(|e| e.code()), Some(UNREAD), "{text}");
         }
         assert!(defined("RWByteAddressBuffer b : register(u0);").is_none());
+        assert!(defined("#define RSX \"UAV(u0)\"").is_none());
+        assert_eq!(defined("  #define\tRS  \"UAV(u0)\" \n"), Some("UAV(u0)"));
+        assert_eq!(defined("#define RS\t\"UAV(u0)\""), Some("UAV(u0)"));
     }
 
     /// The part of a container is found only there.
@@ -605,5 +887,8 @@ mod tests {
         assert!(!has_part(&code, *b"SHDR"));
         assert!(!has_part(&code[..30], *b"RTS0"));
         assert!(!has_part(b"DXIL", *b"RTS0"));
+        // A count past the container's end is not read.
+        code[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!has_part(&code, *b"RTS0"));
     }
 }
