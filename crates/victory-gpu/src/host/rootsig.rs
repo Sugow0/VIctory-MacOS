@@ -29,10 +29,23 @@ pub(crate) fn root_signature(
     };
     // SAFETY: the blob's own bytes, alive through the call.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        let bytes = parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         device.CreateRootSignature(0, bytes)
     }
+}
+
+/// The `count` items at `at`, or none when `at` is null or `count` is 0
+/// (`from_raw_parts` refuses a null pointer, even for a count of 0).
+///
+/// # Safety
+/// Unless null or with a count of 0, `at` points at `count` live items that
+/// outlive `'a`.
+unsafe fn parts<'a, T>(at: *const T, count: usize) -> &'a [T] {
+    if at.is_null() || count == 0 {
+        return &[];
+    }
+    // SAFETY: as the caller promises.
+    unsafe { std::slice::from_raw_parts(at, count) }
 }
 
 /// The root signature serialized from `source`'s string when `code` has none
@@ -112,7 +125,7 @@ pub(crate) fn serialize(text: &str) -> Result<ID3DBlob> {
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(
+                parts(
                     errors.GetBufferPointer().cast::<u8>(),
                     errors.GetBufferSize(),
                 )
@@ -557,9 +570,7 @@ mod tests {
 
     fn bytes(blob: &ID3DBlob) -> &[u8] {
         // SAFETY: the blob's own bytes, borrowed with it.
-        unsafe {
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-        }
+        unsafe { parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()) }
     }
 
     /// The default a range's flags of none stand for in version 1.1.
@@ -611,16 +622,13 @@ mod tests {
             if desc.Version == D3D_ROOT_SIGNATURE_VERSION_1_0 {
                 let d = &desc.Anonymous.Desc_1_0;
                 out.push(format!("flags {}", d.Flags.0));
-                for p in std::slice::from_raw_parts(d.pParameters, d.NumParameters as usize) {
+                for p in parts(d.pParameters, d.NumParameters as usize) {
                     let shown = p.ShaderVisibility.0;
                     match p.ParameterType {
                         D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => {
                             let t = p.Anonymous.DescriptorTable;
                             out.push(format!("table {shown}"));
-                            for r in std::slice::from_raw_parts(
-                                t.pDescriptorRanges,
-                                t.NumDescriptorRanges as usize,
-                            ) {
+                            for r in parts(t.pDescriptorRanges, t.NumDescriptorRanges as usize) {
                                 out.push(format!(
                                     "  range {} {} {} {} {}",
                                     r.RangeType.0,
@@ -647,24 +655,20 @@ mod tests {
                         }
                     }
                 }
-                for s in std::slice::from_raw_parts(d.pStaticSamplers, d.NumStaticSamplers as usize)
-                {
+                for s in parts(d.pStaticSamplers, d.NumStaticSamplers as usize) {
                     out.push(sampler_words(s));
                 }
                 return out;
             }
             let d = &desc.Anonymous.Desc_1_1;
             out.push(format!("flags {}", d.Flags.0));
-            for p in std::slice::from_raw_parts(d.pParameters, d.NumParameters as usize) {
+            for p in parts(d.pParameters, d.NumParameters as usize) {
                 let shown = p.ShaderVisibility.0;
                 match p.ParameterType {
                     D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => {
                         let t = p.Anonymous.DescriptorTable;
                         out.push(format!("table {shown}"));
-                        for r in std::slice::from_raw_parts(
-                            t.pDescriptorRanges,
-                            t.NumDescriptorRanges as usize,
-                        ) {
+                        for r in parts(t.pDescriptorRanges, t.NumDescriptorRanges as usize) {
                             out.push(format!(
                                 "  range {} {} {} {} {} {}",
                                 r.RangeType.0,
@@ -695,7 +699,7 @@ mod tests {
                     }
                 }
             }
-            for s in std::slice::from_raw_parts(d.pStaticSamplers, d.NumStaticSamplers as usize) {
+            for s in parts(d.pStaticSamplers, d.NumStaticSamplers as usize) {
                 out.push(sampler_words(s));
             }
         }
@@ -795,7 +799,7 @@ mod tests {
         use windows::core::s;
         let host = crate::host::host().expect("a device");
         let all = our_strings();
-        let mut skipped = 0;
+        let (mut skipped, mut versions) = (0, std::collections::BTreeMap::new());
         for (file, text) in &all {
             let source = shader(text);
             let code = crate::host::compile(&source, s!("main"), s!("cs_5_1")).unwrap();
@@ -820,6 +824,7 @@ mod tests {
             assert!(!has_part(stripped, *b"RTS0"), "{file}: {text}");
             let ours = fallback(stripped, &source).unwrap().expect("no RTS0 left");
             let (theirs, ours_words) = compared(&code, bytes(&ours));
+            *versions.entry(theirs[0].clone()).or_insert(0) += 1;
             assert_eq!(theirs, ours_words, "{file}: {text}");
             let root = root_signature(&host.device, stripped, &source).unwrap();
             // SAFETY: the description points at live data.
@@ -836,6 +841,11 @@ mod tests {
             };
             pso.unwrap_or_else(|e| panic!("{file}: {text}: {e}"));
         }
+        eprintln!(
+            "compared {} of {} ({versions:?})",
+            all.len() - skipped,
+            all.len()
+        );
         if skipped > 0 {
             eprintln!("skipped compare: no RTS0 ({skipped} of {})", all.len());
         }
