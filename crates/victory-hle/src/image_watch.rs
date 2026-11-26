@@ -91,6 +91,8 @@ pub(crate) fn start(base: usize) {
 mod tests {
     use super::*;
 
+    /// Reads memory through the host (`ReadProcessMemory`), Windows only.
+    #[cfg(windows)]
     #[test]
     fn words_are_read_where_they_are_named() {
         let all = words("used=98d26d8:8, failed = 0x10:1,odd=3:3,none");
