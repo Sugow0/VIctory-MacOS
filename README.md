@@ -104,6 +104,14 @@ Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
 
+### Build on macOS
+
+The exe can be cross-built on a Mac (it still runs only on Windows): with rustup,
+`brew install llvm lld` and `cargo install --locked cargo-xwin`, run
+`scripts/build-windows-on-macos.sh --accept-license` (this accepts the license of
+the Microsoft CRT and SDK that cargo-xwin downloads). It writes
+`target/x86_64-pc-windows-msvc/diag/victory.exe`; extra args go to cargo.
+
 ## What is different here
 
 In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
