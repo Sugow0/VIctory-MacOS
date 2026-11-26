@@ -343,7 +343,7 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let root: ID3D12RootSignature = crate::host::root_signature(device, bytes, source)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -869,7 +869,7 @@ void main() {
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
             );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature = crate::host::root_signature(device, bytes, source)?;
             let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -3604,12 +3604,12 @@ void work() {
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
 
-                let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs[..]).ok()?;
+                let root: ID3D12RootSignature = crate::host::root_signature(&device, &vs, DRAW).ok()?;
                 let pipelines = [
                     pipeline(&device, &root, &vs, &ps[0]),
                     pipeline(&device, &root, &vs, &ps[1]),
                 ];
-                let work_root: ID3D12RootSignature = device.CreateRootSignature(0, &cs[..]).ok()?;
+                let work_root: ID3D12RootSignature = crate::host::root_signature(&device, &cs, WORK).ok()?;
                 let work: ID3D12PipelineState = device
                     .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                         pRootSignature: std::mem::transmute_copy(&work_root),

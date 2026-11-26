@@ -86,7 +86,7 @@ fn pass(host: &Host) -> Option<&'static Pass> {
         // SAFETY: the code lives through the calls; the root signature is
         // inside it.
         unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).ok()?;
+            let root: ID3D12RootSignature = super::root_signature(&host.device, &code, SCATTER).ok()?;
             let pso: ID3D12PipelineState = host
                 .device
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
