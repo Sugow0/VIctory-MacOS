@@ -51,6 +51,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --locked -- --test-threads=1
 
+  macos:
+    name: macOS check and tests
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # The runtime is Windows-only; the rest must build and pass here.
+      - name: Check
+        run: cargo check --workspace --all-targets --target aarch64-apple-darwin --locked
+      - name: Tests
+        run: cargo test --target aarch64-apple-darwin -p victory-core -p victory-formats -p victory-pe -p victory-pipeline -p victory-game -p victory-shader --locked
+
   check:
     needs: [clippy, test-default, test-diagnostics]
     if: always()
