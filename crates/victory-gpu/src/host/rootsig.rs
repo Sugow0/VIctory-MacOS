@@ -38,8 +38,9 @@ pub(crate) fn root_signature(
 /// (`from_raw_parts` refuses a null pointer, even for a count of 0).
 ///
 /// # Safety
-/// Unless null or with a count of 0, `at` points at `count` live items that
-/// outlive `'a`.
+/// Unless null or with a count of 0, `at` points at `count` live items,
+/// aligned for `T`, that outlive `'a` and are not changed during it, with
+/// `count * size_of::<T>()` at most `isize::MAX`.
 unsafe fn parts<'a, T>(at: *const T, count: usize) -> &'a [T] {
     if at.is_null() || count == 0 {
         return &[];
