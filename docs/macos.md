@@ -1,8 +1,11 @@
 # Running on macOS (Apple silicon)
 
 victory.exe stays a Windows program. On a Mac it runs under Wine, with
-Direct3D 12 translated to Metal by Apple's D3DMetal, which ships in the Game
-Porting Toolkit and in CrossOver. `scripts/play-macos.sh` is the counterpart
+Direct3D 12 translated to Metal by Apple's D3DMetal. Apple's Game Porting
+Toolkit 2 and later ship only D3DMetal, no Wine: the Wine is either one built
+from Apple's Homebrew tap (formula `game-porting-toolkit`, still 1.1, Wine
+from crossover-sources 22.1.1) with GPTK 2+'s D3DMetal libraries copied in,
+or CrossOver, which bundles D3DMetal. `scripts/play-macos.sh` is the counterpart
 of `scripts/play.ps1`.
 
 ## Status: untested with the title
@@ -13,8 +16,10 @@ D3DMetal do with victory.exe is not. Known risks:
 
 - **Heaps opened on title memory.** `OpenExistingHeapFromAddress(1)`
   (`crates/victory-gpu/src/inplace.rs:240`, `open`) is what renderer port 1
-  (`VICTORY_PORT_CONSTANTS=1`, off by default, `port.rs:207`) and the
-  in-place census use. D3DMetal may not implement it, or only on memory it
+  (`VICTORY_PORT_CONSTANTS=1`, off by default; read at
+  `crates/victory-hle/src/modules/xmem.rs:1088` and
+  `crates/victory-gpu/src/port.rs:78`, the heap opened at `port.rs:207`) and
+  the in-place census use. D3DMetal may not implement it, or only on memory it
   allocated itself; then those paths fail and the copies stay.
 - **Mesh shaders** (`DispatchMesh`, `crates/victory-gpu/src/draw.rs:3281`):
   D3DMetal maps them onto Metal's mesh shaders; which of the title's
@@ -33,19 +38,27 @@ D3DMetal do with victory.exe is not. Known risks:
   (`inplace.rs`, `host.rs`), which needs `d3dcompiler_47.dll` in the prefix.
   Wine has its own builtin; if it refuses those shaders, a native
   `d3dcompiler_47.dll` is needed.
-- **AVX2 under Rosetta.** victory.exe is built for AVX2; Rosetta translates
-  it from macOS 15 on, at a cost not measured here.
+- **AVX2 under Rosetta.** victory.exe is built for AVX2 and checks it by
+  cpuid. The sources disagree, and none of this is tested here:
+  AppleGamingWiki has Rosetta's AVX2 from macOS 15.0; Apple's developer
+  forums (<https://developer.apple.com/forums/thread/769486>) from 15.4, and
+  reported by cpuid only with `ROSETTA_ADVERTISE_AVX=1`. The launcher sets
+  `ROSETTA_ADVERTISE_AVX=1`, refuses macOS below 15.0 and warns below 15.4.
+  Its cost is not measured.
+- **Ray tracing** under D3DMetal is untested; `--ray-tracing` only sets what
+  `-RayTracing` sets on Windows.
 
 Try `--safe` first.
 
 ## What you need
 
-- A Mac with Apple silicon, macOS 15 (Sequoia) or later, Rosetta 2
+- A Mac with Apple silicon, macOS 15 (Sequoia) or later, 15.4 or later
+  preferred (see AVX2 above), Rosetta 2
   (`softwareupdate --install-rosetta --agree-to-license`).
 - 64 GB of unified memory recommended, as on Windows (README.md): the title
   takes about 30 GB of private memory plus about 10.5 GB on the GPU side.
-- A Wine with D3DMetal: Apple's Game Porting Toolkit 2 or later (its
-  `wine64`), or CrossOver 24 or later.
+- A Wine with D3DMetal: a Wine built from Apple's tap, with the D3DMetal
+  libraries of GPTK 2 or later copied in, or CrossOver 24 or later.
 - Rust (the toolchain is pinned) and your own dump of the title.
 
 ## Building
@@ -62,9 +75,11 @@ Try `--safe` first.
   scripts/build-windows-on-macos.sh
   ```
 
-  It lands in `target/x86_64-pc-windows-msvc/<profile>/victory.exe`. A
-  victory.exe built on Windows and copied to `target/<profile>/victory.exe`
-  is used when the first one is missing.
+  (added by #3, a separate pull request). It lands in
+  `target/x86_64-pc-windows-msvc/<profile>/victory.exe`. Until then, build
+  victory.exe on Windows (README.md) and copy `target\diag\victory.exe` to
+  `target/diag/victory.exe` here: the launcher uses it when the first one
+  is missing.
 
 ## Running
 
@@ -83,18 +98,23 @@ be given as Unix paths: the launcher turns them into `Z:` paths.
 |---|---|
 | `-Exe <path>` | `--exe <path>` |
 | `-Safe` | `--safe` |
-| `-RayTracing` | `--ray-tracing` (also `D3DM_SUPPORT_DXR=1`) |
+| `-RayTracing` | `--ray-tracing` |
 | `-Build diag\|release` | `--build diag\|release` |
 | `-More @{K='V'}` | `--more K=V`, repeatable |
 | | `--dry-run`: prints the environment and the command |
 
-Which Wine: `WINE` if set; else `wine64` on `PATH` or in
-`/usr/local/opt/game-porting-toolkit/bin` (Game Porting Toolkit, with
-`WINEESYNC=1` as Apple's read-me has it); else CrossOver's
-`/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`,
-in the bottle `CX_BOTTLE` names. Outside CrossOver the prefix is
-`WINEPREFIX`, by default `~/.victory-wine`, made with `wineboot --init` the
-first time.
+Which Wine (the launcher always prints the one it chose): `WINE` if set;
+else `/usr/local/opt/game-porting-toolkit/bin/wine64` (Apple's tap, with
+`WINEESYNC=1`); else a `wine64` on `PATH`, with a warning, since whether it
+has D3DMetal is not checked; else CrossOver's
+`/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`.
+Outside CrossOver the prefix is `WINEPREFIX`, by default `~/.victory-wine`,
+made with `wineboot --init` the first time.
+
+With CrossOver, `CX_BOTTLE` is required: make a bottle (Windows 10 64-bit)
+and turn D3DMetal on in its settings. CrossOver would otherwise use its
+default bottle, which may not have D3DMetal on, so the launcher refuses to
+guess.
 
 The ahead-of-time steps (README.md) run the same way, through Wine:
 
