@@ -72,14 +72,22 @@ Try `--safe` first.
 - victory.exe itself, cross-built on the Mac (issue #3):
 
   ```sh
-  scripts/build-windows-on-macos.sh
+  brew install llvm lld
+  ~/.cargo/bin/cargo install --locked cargo-xwin
+  scripts/build-windows-on-macos.sh --accept-license
   ```
 
-  (added by Sugow0/VIctory-MacOS#3, a separate pull request). It lands in
-  `target/x86_64-pc-windows-msvc/<profile>/victory.exe`. Until then, build
-  victory.exe on Windows (README.md) and copy `target\diag\victory.exe` to
-  `target/diag/victory.exe` here: the launcher uses it when the first one
-  is missing.
+  It uses rustup's cargo, Homebrew's `clang-cl` and `lld-link`, and the
+  Microsoft CRT and Windows SDK that cargo-xwin downloads on first use
+  (about 1 GB in `~/Library/Caches/cargo-xwin`); `--accept-license` (or
+  `XWIN_ACCEPT_LICENSE=1`) accepts their license. Arguments replace the
+  default `--locked --profile diag -p victory --features diagnostics`, for
+  example `scripts/build-windows-on-macos.sh --accept-license --locked
+  --release -p victory`; the target is always `x86_64-pc-windows-msvc`. It
+  lands in `target/x86_64-pc-windows-msvc/<profile>/victory.exe` and the
+  script prints the path. A victory.exe built on Windows (README.md) and
+  copied to `target/diag/victory.exe` here also works: the launcher uses it
+  when the first one is missing.
 
 ## Running
 

@@ -106,6 +106,9 @@ Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
 
+To cross-build victory.exe on a Mac with cargo-xwin
+(`scripts/build-windows-on-macos.sh`): [docs/macos.md](docs/macos.md#building).
+
 ## What is different here
 
 In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
