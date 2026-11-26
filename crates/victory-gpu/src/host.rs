@@ -1561,7 +1561,7 @@ impl PlanePass {
         // SAFETY: the root signature is inside the pixel shader; the
         // description points at live data and never releases its pointer.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let root: ID3D12RootSignature = root_signature(device, &ps, source)?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -3847,6 +3847,8 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 pub(crate) mod rec;
+mod rootsig;
+pub(crate) use rootsig::root_signature;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -4370,7 +4372,7 @@ impl Host {
         // shader.
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature = root_signature(&self.device, bytes, CARD_COMPARE)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {

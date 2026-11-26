@@ -126,7 +126,7 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
     // root signature is inside it. Two closed lists, sent in turn, whose
     // objects live until what was sent last has run.
     unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
+        let root: ID3D12RootSignature = super::root_signature(device, &code, COUNT)?;
         let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {

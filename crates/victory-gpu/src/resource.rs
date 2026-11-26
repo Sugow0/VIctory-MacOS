@@ -4426,7 +4426,7 @@ float4 lit() : SV_Target { return 1.0; }
         // SAFETY: plain creation; the description points at live data.
         let (signature, pipeline) = unsafe {
             let signature: ID3D12RootSignature =
-                host.device.CreateRootSignature(0, &vs[..]).unwrap();
+                crate::host::root_signature(&host.device, &vs, SOURCE).unwrap();
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&signature),
                 VS: code(&vs[..]),

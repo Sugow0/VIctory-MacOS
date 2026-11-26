@@ -224,7 +224,7 @@ fn bench_indirect_draw_barriers() {
 
         // The pipeline: tiny triangles into a small target.
         let (vs, ps) = (compile("vs", "vs_5_1"), compile("ps", "ps_5_1"));
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs).unwrap();
+        let root: ID3D12RootSignature = crate::host::root_signature(device, &vs, SHADERS).unwrap();
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             VS: D3D12_SHADER_BYTECODE {

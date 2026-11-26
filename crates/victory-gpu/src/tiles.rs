@@ -1283,7 +1283,7 @@ void look() {
         // SAFETY: plain object creation; the views are made in a heap
         // that lives to the end of the function, of a live texture.
         let (root, pipeline, views, words, back) = unsafe {
-            let root: ID3D12RootSignature = rig.device.CreateRootSignature(0, &cs[..]).ok()?;
+            let root: ID3D12RootSignature = crate::host::root_signature(&rig.device, &cs, LOOK).ok()?;
             let pipeline: ID3D12PipelineState = rig
                 .device
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
