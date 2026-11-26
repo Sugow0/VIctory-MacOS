@@ -11,6 +11,11 @@
 # Contents and Workflows, read and write, on this repository only). The
 # built-in GITHUB_TOKEN is refused as soon as an upstream commit changes a
 # file under .github/workflows.
+#
+# Fine-grained tokens expire (a year at most): an expired one shows up as a
+# failed push. GitHub pauses scheduled workflows of a public repository after
+# 60 days without activity; re-enable it from the Actions tab when it does.
+# A push made with this token starts ci.yml on main (upstream's CI, again).
 name: Sync main with upstream
 
 on:
@@ -43,7 +48,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 0
