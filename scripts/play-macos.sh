@@ -1,7 +1,7 @@
 #!/bin/bash
-# Starts the title on macOS (Apple silicon) through Wine, with Direct3D 12
-# translated by Apple's D3DMetal (Game Porting Toolkit's wine64, or
-# CrossOver), with the settings scripts/play.ps1 plays with (docs/macos.md).
+# Starts the title on macOS (Apple silicon) through Wine, Direct3D 12 translated
+# by Apple's D3DMetal (Apple's tap's Wine + GPTK 2+'s D3DMetal, or CrossOver),
+# with the settings scripts/play.ps1 plays with (docs/macos.md).
 #   scripts/play-macos.sh --exe <path of your own copy's executable>
 # --safe           without the newer, faster ways (the first thing to try when something is wrong)
 # --ray-tracing    the title's own ray-traced indirect light: lit interiors, about a third slower
@@ -9,11 +9,11 @@
 # --more K=V       other settings, repeatable: --more VICTORY_PANEL=1
 # --dry-run        prints the environment and the command, starts nothing
 # Environment: WINE (the wine to use), WINEPREFIX (default ~/.victory-wine),
-# CX_BOTTLE (CrossOver's bottle).
+# CX_BOTTLE (CrossOver's bottle, required with CrossOver).
 # Written for macOS's own /bin/bash (3.2): no associative arrays.
 set -euo pipefail
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "play-macos: $*" >&2; exit 1; }
 
 exe=''
@@ -32,8 +32,10 @@ while [ $# -gt 0 ]; do
         --build) [ $# -ge 2 ] || die "--build needs diag or release"; build=$2; shift 2 ;;
         --build=*) build=${1#--build=}; shift ;;
         --more) [ $# -ge 2 ] || die "--more needs KEY=VALUE"; kv=$2; shift 2
-            case "$kv" in [A-Za-z_]*=*) ;; *) die "--more takes KEY=VALUE, not '$kv'" ;; esac
-            more_keys+=("${kv%%=*}"); more_vals+=("${kv#*=}") ;;
+            key=${kv%%=*}
+            case "$kv" in *=*) ;; *) die "--more takes KEY=VALUE, not '$kv'" ;; esac
+            case "$key" in ''|[0-9]*|*[!A-Za-z0-9_]*) die "--more: '$key' is not a variable name ([A-Za-z_][A-Za-z0-9_]*)" ;; esac
+            more_keys+=("$key"); more_vals+=("${kv#*=}") ;;
         --dry-run) dry_run=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown argument '$1'" ;;
@@ -71,8 +73,19 @@ for i in "${!more_keys[@]}"; do set_setting "${more_keys[$i]}" "${more_vals[$i]}
 arch -x86_64 /usr/bin/true 2>/dev/null \
     || die "Rosetta 2 is not installed: softwareupdate --install-rosetta --agree-to-license"
 macos=$(sw_vers -productVersion)
-# Rosetta translates AVX2 (which victory.exe is built for) from macOS 15 on.
-[ "${macos%%.*}" -ge 15 ] || die "macOS 15 or later is needed (Rosetta's AVX2); this is $macos"
+# Rosetta's AVX2 (which victory.exe is built for): the sources disagree.
+# AppleGamingWiki has it from macOS 15.0; Apple's developer forums
+# (https://developer.apple.com/forums/thread/769486) from 15.4, and only
+# reported by cpuid with ROSETTA_ADVERTISE_AVX=1. victory checks AVX2 by
+# cpuid, so it is asked for. Untested here.
+macos_major=${macos%%.*}
+macos_minor=$(printf '%s' "$macos" | cut -d. -f2)
+case "$macos_minor" in ''|*[!0-9]*) macos_minor=0 ;; esac
+[ "$macos_major" -ge 15 ] || die "macOS 15 or later is needed (Rosetta's AVX2); this is $macos"
+if [ "$macos_major" -eq 15 ] && [ "$macos_minor" -lt 4 ]; then
+    echo "play-macos: warning: macOS $macos; Rosetta may report AVX2 only from 15.4 on" >&2
+fi
+export ROSETTA_ADVERTISE_AVX="${ROSETTA_ADVERTISE_AVX:-1}"
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 # Built on the Mac (cross target), or copied from a Windows build.
@@ -83,7 +96,11 @@ victory="$repo/target/x86_64-pc-windows-msvc/$build/victory.exe"
 exe="$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")"
 
 # A Unix path as Windows sees it: Wine's Z: drive is the Unix root.
-to_windows() { local p=$1; printf 'Z:%s' "${p//\//\\}"; }
+to_windows() {
+    local p
+    p=$(printf '%s' "$1" | tr -s /)
+    printf 'Z:%s' "${p//\//\\}"
+}
 
 # --- Wine -----------------------------------------------------------------
 kind=''
@@ -93,37 +110,40 @@ crossover=/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine
 if [ -n "${WINE:-}" ]; then
     kind=env; wine=$WINE
     [ -x "$wine" ] || command -v "$wine" >/dev/null 2>&1 || die "WINE=$wine is not an executable"
-elif command -v wine64 >/dev/null 2>&1; then
-    kind=gptk; wine=$(command -v wine64)
 elif [ -x "$gptk" ]; then
+    # Apple's tap (formula game-porting-toolkit, Wine of crossover-sources
+    # 22.1.1); D3DMetal comes from GPTK 2+, copied in by hand.
     kind=gptk; wine=$gptk
+elif command -v wine64 >/dev/null 2>&1; then
+    kind=wine; wine=$(command -v wine64)
+    echo "play-macos: warning: $wine is a wine64 found on PATH; whether it has D3DMetal is not checked" >&2
 elif [ -x "$crossover" ]; then
     kind=crossover; wine=$crossover
 else
-    die "no Wine with D3DMetal found. Install Apple's Game Porting Toolkit 2 or later (its wine64 on PATH or in /usr/local/opt/game-porting-toolkit/bin), or CrossOver 24 or later in /Applications, or set WINE to a wine binary (docs/macos.md)."
+    die "no Wine with D3DMetal found. Install a Wine built from Apple's tap (/usr/local/opt/game-porting-toolkit/bin/wine64) with the D3DMetal libraries of Game Porting Toolkit 2 or later copied in, or CrossOver 24 or later in /Applications, or set WINE to a wine binary (docs/macos.md)."
 fi
+echo "play-macos: wine ($kind): $wine" >&2
 wine_args=()
 wine_env=()
 if [ "$kind" = crossover ]; then
     # CrossOver keeps its prefixes as bottles; WINEPREFIX is not its way.
-    if [ -n "${CX_BOTTLE:-}" ]; then wine_args=(--bottle "$CX_BOTTLE"); fi
+    # D3DMetal is a per-bottle setting, so the bottle is named on purpose
+    # rather than left to CrossOver's default one.
+    [ -n "${CX_BOTTLE:-}" ] || die "with CrossOver, set CX_BOTTLE to a bottle with D3DMetal turned on in its settings (docs/macos.md)"
+    wine_args=(--bottle "$CX_BOTTLE")
 else
     export WINEPREFIX="${WINEPREFIX:-$HOME/.victory-wine}"
     wine_env+=("WINEPREFIX=$WINEPREFIX")
 fi
 if [ "$kind" = gptk ] && [ -z "${WINEESYNC+x}" ]; then
-    # Apple's Game Porting Toolkit read-me starts games with WINEESYNC=1
+    # Apple's Game Porting Toolkit 1 read-me starts games with WINEESYNC=1
     # (eventfd-based synchronization, fewer wineserver round trips). CrossOver
     # sets its sync per bottle, so it is left alone there; WINEMSYNC is not
     # set, since nothing documents it for either.
     export WINEESYNC=1
 fi
 if [ -n "${WINEESYNC+x}" ]; then wine_env+=("WINEESYNC=$WINEESYNC"); fi
-if [ "$ray_tracing" = 1 ]; then
-    # D3DMetal reports no DirectX ray tracing unless asked (GPTK 2's read-me).
-    export D3DM_SUPPORT_DXR=1
-    wine_env+=("D3DM_SUPPORT_DXR=1")
-fi
+wine_env+=("ROSETTA_ADVERTISE_AVX=$ROSETTA_ADVERTISE_AVX")
 
 # --- The environment, as play.ps1 leaves it --------------------------------
 # (Other settings left over in this shell go; where your files are stays.)
@@ -161,9 +181,11 @@ if [ ${#wine_args[@]} -gt 0 ]; then command+=("${wine_args[@]}"); fi
 command+=("$victory" run "$(to_windows "$exe")" --execute)
 
 if [ "$dry_run" = 1 ]; then
-    echo "# wine ($kind): $wine"
     for e in ${wine_env[@]+"${wine_env[@]}"} ${path_env[@]+"${path_env[@]}"}; do printf 'export %q\n' "$e"; done
-    for i in "${!keys[@]}"; do printf 'export %q\n' "${keys[$i]}=${vals[$i]}"; done
+    for i in "${!keys[@]}"; do
+        in_list "${keys[$i]}" "$paths" && continue   # shown above, as Windows gets them
+        printf 'export %q\n' "${keys[$i]}=${vals[$i]}"
+    done
     if [ "$kind" != crossover ] && [ ! -f "$WINEPREFIX/system.reg" ]; then
         printf '%q wineboot --init\n' "$wine"
     fi
