@@ -68,8 +68,10 @@ if [ "$kind" = crossover ]; then
     [ -n "${CX_BOTTLE:-}" ] || die "with CrossOver, name the bottle: --bottle B or CX_BOTTLE=B"
     wine_cmd+=(--bottle "$CX_BOTTLE")
     # Asked of CrossOver itself; CX_BOTTLE_PATH (CrossOver's own) otherwise.
-    system32=$("${wine_cmd[@]}" winepath -u 'C:\windows\system32' 2>/dev/null | tr -d '\r') || system32=''
-    [ -n "$system32" ] \
+    # Wine may print other lines first: its last line, if it is a folder.
+    system32=$("${wine_cmd[@]}" winepath -u 'C:\windows\system32' 2>/dev/null | tr -d '\r' | tail -n 1) || system32=''
+    system32=${system32%/}
+    [ -n "$system32" ] && [ -d "$system32" ] \
         || system32="${CX_BOTTLE_PATH:-$HOME/Library/Application Support/CrossOver/Bottles}/$CX_BOTTLE/drive_c/windows/system32"
     system32=${system32%/}
 else
@@ -146,6 +148,7 @@ else
         say "kept Wine's builtin as $backup"
     fi
     # A new file moved over the old one: never written through a link.
+    rm -f "$target.tmp"
     cp "$dll" "$target.tmp"
     mv -f "$target.tmp" "$target"
     say "installed $target"
