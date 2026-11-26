@@ -106,7 +106,10 @@ to_windows() {
 kind=''
 wine=''
 gptk=/usr/local/opt/game-porting-toolkit/bin/wine64
-crossover=/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine
+# CrossOver in /Applications first, then in the user's own ~/Applications.
+crossover_wine=CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine
+crossover=/Applications/$crossover_wine
+[ -x "$crossover" ] || crossover=$HOME/Applications/$crossover_wine
 if [ -n "${WINE:-}" ]; then
     kind=env; wine=$WINE
     [ -x "$wine" ] || command -v "$wine" >/dev/null 2>&1 || die "WINE=$wine is not an executable"
@@ -120,7 +123,7 @@ elif command -v wine64 >/dev/null 2>&1; then
 elif [ -x "$crossover" ]; then
     kind=crossover; wine=$crossover
 else
-    die "no Wine with D3DMetal found. Install a Wine built from Apple's tap (/usr/local/opt/game-porting-toolkit/bin/wine64) with the D3DMetal libraries of Game Porting Toolkit 2 or later copied in, or CrossOver 24 or later in /Applications, or set WINE to a wine binary (docs/macos.md)."
+    die "no Wine with D3DMetal found. Install a Wine built from Apple's tap (/usr/local/opt/game-porting-toolkit/bin/wine64) with the D3DMetal libraries of Game Porting Toolkit 2 or later copied in, or CrossOver 24 or later in /Applications or ~/Applications, or set WINE to a wine binary (docs/macos.md)."
 fi
 echo "play-macos: wine ($kind): $wine" >&2
 wine_args=()
