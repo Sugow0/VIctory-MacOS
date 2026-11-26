@@ -289,6 +289,11 @@ pub fn run(
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
+    // Pairs need a host device, which only Windows has: refused before the walk.
+    #[cfg(not(windows))]
+    if !pairs.is_empty() {
+        Host::new(false).map_err(anyhow::Error::msg)?;
+    }
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
