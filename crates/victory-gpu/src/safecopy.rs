@@ -975,11 +975,13 @@ mod tests {
                 3 => (0, 127, 4),
                 _ => (0, 128, 0),
             };
+            let mut one = None;
             if shape == 2 {
                 // A byte of the one block that is new to the title too.
                 let i = from + random() as usize % 32;
                 was[i] = title[i];
                 now[i] = !title[i];
+                one = Some(i);
             }
             let (mut held_a, mut held_b) = (was.clone(), was.clone());
             let (mut counts_a, mut counts_b) = ([0u64; 2], [0u64; 2]);
@@ -997,8 +999,9 @@ mod tests {
                 for &block in &whole {
                     assert_eq!(there[block..block + 32], now[block..block + 32], "round {round}: whole block {block}");
                 }
-                if shape == 2 {
+                if let Some(i) = one {
                     assert!(counts_a[1] > 0, "round {round}: the 1-block merge stored nothing");
+                    assert_eq!(there[i], now[i], "round {round}: the 1-block merge's new byte {i}");
                 }
                 std::ptr::copy_nonoverlapping(title.as_ptr(), a.0, 4096);
                 std::ptr::copy_nonoverlapping(title.as_ptr(), b.0, 4096);
