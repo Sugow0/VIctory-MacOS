@@ -123,8 +123,14 @@ fn limit(typed: &str, max: u32) -> String {
     typed.chars().take(max as usize).collect()
 }
 
+/// Without a host dialog (a build for another host than Windows): dismissed.
+#[cfg(all(not(test), not(windows)))]
+fn ask(_: &str, _: &str, _: &str, _: u32) -> Option<String> {
+    None
+}
+
 /// Asks the user in a modal host dialog; `None` if dismissed.
-#[cfg(not(test))]
+#[cfg(all(not(test), windows))]
 fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
     dialog::ask(title, description, default, max)
 }
@@ -136,6 +142,7 @@ fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
+#[cfg(windows)]
 mod dialog {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;

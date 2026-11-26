@@ -1993,6 +1993,14 @@ impl ValueWait {
         met
     }
 
+    /// Without title memory (a build for another host than Windows, where
+    /// the runtime is not there), every wait counts as met.
+    #[cfg(not(windows))]
+    fn holds(&self) -> bool {
+        true
+    }
+
+    #[cfg(windows)]
     fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {

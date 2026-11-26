@@ -425,7 +425,15 @@ fn title_priority(asked: i32) -> i32 {
     }
 }
 
+/// [`title_priority`]; without a host (a build for another host than
+/// Windows) it fails.
+#[cfg(not(windows))]
+pub extern "system" fn SetThreadPriority(_: *mut c_void, _: i32) -> i32 {
+    0
+}
+
 /// [`title_priority`].
+#[cfg(windows)]
 pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
@@ -685,6 +693,7 @@ mod tests {
 
     /// The title's idle and lowest threads run below normal; the others as
     /// it sets them.
+    #[cfg(windows)]
     #[test]
     fn no_title_thread_waits_for_idle_processors() {
         let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();

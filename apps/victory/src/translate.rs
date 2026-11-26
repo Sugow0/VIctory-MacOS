@@ -9,8 +9,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
+use victory_shader::emit;
+#[cfg(not(windows))]
+use no_host::{self as host, Host, Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -973,6 +978,66 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Without host D3D12 or dxil.dll (a build for another host than Windows):
+/// translation runs, pipeline checks and validation cannot be made.
+#[cfg(not(windows))]
+mod no_host {
+    use std::path::{Path, PathBuf};
+
+    use victory_shader::emit::HostShader;
+
+    const NO_HOST: &str = "host pipelines and DXIL validation need Windows";
+
+    /// No host device: [`Host::new`] always fails.
+    pub enum Host {}
+
+    impl Host {
+        pub fn new(_: bool) -> Result<Self, String> {
+            Err(NO_HOST.into())
+        }
+        pub fn adapter_name(&self) -> Option<String> {
+            match *self {}
+        }
+        pub fn translation_caps(&self) -> Option<(u32, bool)> {
+            match *self {}
+        }
+        pub fn pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+        pub fn mesh_pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+        pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+    }
+
+    /// Only paired with a [`Host`], which cannot be made here.
+    pub fn stub_ps() -> HostShader {
+        unreachable!("{NO_HOST}")
+    }
+
+    /// Only called with a [`Host`], which cannot be made here.
+    pub fn stub_vs(_: &HostShader) -> Result<HostShader, String> {
+        Err(NO_HOST.into())
+    }
+
+    /// No dxil.dll: [`Validator::load`] always fails.
+    pub enum Validator {}
+
+    impl Validator {
+        pub fn default_path() -> Option<PathBuf> {
+            None
+        }
+        pub fn load(_: Option<&Path>) -> Result<Self, String> {
+            Err(NO_HOST.into())
+        }
+        pub fn validate(&mut self, _: &mut [u8]) -> Result<(), String> {
+            match *self {}
+        }
+    }
 }
 
 #[cfg(test)]
