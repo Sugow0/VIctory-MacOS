@@ -34,6 +34,8 @@ profile=debug
 target_dir="${CARGO_TARGET_DIR:-target}"
 prev=
 for arg in "${cargo_args[@]}"; do
+    # What follows `--` goes to the program, not to cargo.
+    [ "$arg" = "--" ] && break
     case "$prev" in
         --profile) profile="$arg" ;;
         --target-dir) target_dir="$arg" ;;
@@ -46,7 +48,8 @@ for arg in "${cargo_args[@]}"; do
     esac
     prev="$arg"
 done
-if [ "$profile" = dev ]; then profile=debug; fi
+# Cargo's folder for its built-in profiles: dev and test in debug/, bench in release/.
+case "$profile" in dev|test) profile=debug ;; bench) profile=release ;; esac
 
 # rustup's cargo honors rust-toolchain.toml; Homebrew's cargo does not.
 [ -x "$HOME/.cargo/bin/cargo" ] || die "rustup's cargo not found in ~/.cargo/bin (install rustup)"
