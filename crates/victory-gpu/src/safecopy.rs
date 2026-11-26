@@ -932,7 +932,10 @@ mod tests {
 
     /// The stores one by one ([`plain_stores`]) leave title memory, what was
     /// held and the counts as the masked ones do, on memory that is there
-    /// (a fault in a masked store would hang under Rosetta).
+    /// (a fault in a masked store would hang under Rosetta): bytes changed
+    /// here and there, whole blocks changed (stored whole), one block at a
+    /// time as [`merge`] does at the ends, and puts at an address that is a
+    /// dword's but no block's.
     #[test]
     fn plain_stores_do_what_masked_ones_do() {
         let (a, b) = (Pages::new(1 << 12), Pages::new(1 << 12));
@@ -943,30 +946,134 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
-        for round in 0..2000u32 {
+        for round in 0..4000u32 {
             let title: Vec<u8> = (0..4096).map(|_| random() as u8).collect();
-            let was: Vec<u8> = (0..4096).map(|_| random() as u8).collect();
+            let mut was: Vec<u8> = (0..4096).map(|_| random() as u8).collect();
             let mut now = was.clone();
             for _ in 0..random() % 200 {
                 let i = random() as usize % 4096;
                 now[i] = if round % 2 == 0 { title[i] } else { random() as u8 };
             }
-            let blocks = 4096 / 32;
+            if round % 4 == 1 {
+                // Whole blocks in which every dword changes.
+                for _ in 0..1 + random() % 40 {
+                    let block = random() as usize % 128 * 32;
+                    for i in block..block + 32 {
+                        was[i] = title[i];
+                        now[i] = !title[i];
+                    }
+                }
+            }
+            // Where and how many blocks: all, one (as at a stretch's ends),
+            // or a put 4 bytes into the page.
+            let (from, blocks, at) = match round % 4 {
+                2 => (random() as usize % 128 * 32, 1, 0),
+                3 => (0, 127, 4),
+                _ => (0, 128, 0),
+            };
             let (mut held_a, mut held_b) = (was.clone(), was.clone());
             let (mut counts_a, mut counts_b) = ([0u64; 2], [0u64; 2]);
-            // SAFETY: our allocations and vectors, 4096 bytes each.
+            // SAFETY: our allocations and vectors, 4096 bytes each; every
+            // call stays inside them.
             unsafe {
                 std::ptr::copy_nonoverlapping(title.as_ptr(), a.0, 4096);
                 std::ptr::copy_nonoverlapping(title.as_ptr(), b.0, 4096);
-                assert_eq!(victory_safe_merge(a.0, now.as_ptr(), held_a.as_mut_ptr(), blocks, &mut counts_a), 0);
-                assert_eq!(victory_safe_merge_plain(b.0, now.as_ptr(), held_b.as_mut_ptr(), blocks, &mut counts_b), 0);
+                let (now_at, held_a_at, held_b_at) = (now.as_ptr().add(from), held_a.as_mut_ptr().add(from), held_b.as_mut_ptr().add(from));
+                assert_eq!(victory_safe_merge(a.0.add(from), now_at, held_a_at, blocks, &mut counts_a), 0);
+                assert_eq!(victory_safe_merge_plain(b.0.add(from), now_at, held_b_at, blocks, &mut counts_b), 0);
                 assert_eq!(std::slice::from_raw_parts(a.0, 4096), std::slice::from_raw_parts(b.0, 4096), "merge, round {round}");
-                assert_eq!((held_a, counts_a), (held_b, counts_b), "merge, round {round}");
+                assert_eq!((&held_a, counts_a), (&held_b, counts_b), "merge, round {round}");
+                if round % 4 == 1 {
+                    assert!(counts_a[1] >= 8, "round {round}: no whole block stored");
+                }
                 std::ptr::copy_nonoverlapping(title.as_ptr(), a.0, 4096);
                 std::ptr::copy_nonoverlapping(title.as_ptr(), b.0, 4096);
-                assert_ne!(victory_safe_put(a.0, was.as_ptr(), now.as_ptr(), blocks), 0);
-                assert_ne!(victory_safe_put_plain(b.0, was.as_ptr(), now.as_ptr(), blocks), 0);
+                let (put_blocks, from) = if at == 0 { (blocks, from) } else { (127, 0) };
+                let (was_at, now_at) = (was.as_ptr().add(from), now.as_ptr().add(from));
+                assert_ne!(victory_safe_put(a.0.add(from + at), was_at, now_at, put_blocks), 0);
+                assert_ne!(victory_safe_put_plain(b.0.add(from + at), was_at, now_at, put_blocks), 0);
                 assert_eq!(std::slice::from_raw_parts(a.0, 4096), std::slice::from_raw_parts(b.0, 4096), "put, round {round}");
+            }
+        }
+    }
+
+    /// The stores one by one ([`plain_stores`]), called as such: where the
+    /// second of two pages is missing, read-only or a guard page, a merge
+    /// leaves with the blocks of the second page left, its counts those of
+    /// the first (r10, used for the stores, given back), what it held of
+    /// the second page as it was; a put fails; nothing of the second page is
+    /// stored and a guard page stays one. The faults: the read of title
+    /// memory (missing, guarded), a dword stored alone (read-only) and a
+    /// whole block stored (read-only, all its dwords changed). Not under
+    /// Wine, the masked stores are held to the same.
+    #[test]
+    fn plain_stores_fail_where_title_memory_is_not_there() {
+        assert!(on());
+        let masked = !on_wine();
+        for (how, whole) in [("missing", false), ("read-only", false), ("read-only", true), ("guarded", false), ("guarded", true)] {
+            for plain in [true, false] {
+                if !plain && !masked {
+                    continue;
+                }
+                let what = format!("{how}, whole {whole}, plain {plain}");
+                let blocks = 2 * 4096 / 32;
+                // One dword changed in each block, or in the second page's
+                // first block all of them.
+                let mut now = vec![0u8; 8192];
+                for block in 0..blocks {
+                    now[block * 32] = 1;
+                }
+                if whole {
+                    now[4096..4128].fill(0x5A);
+                }
+                let second = |pages: &Pages| {
+                    let mut old = 0;
+                    // SAFETY: the second page of our allocation.
+                    unsafe {
+                        match how {
+                            "missing" => VirtualFree(pages.0.add(4096).cast(), 4096, MEM_DECOMMIT),
+                            "read-only" => VirtualProtect(pages.0.add(4096).cast(), 4096, PAGE_READONLY, &mut old),
+                            _ => VirtualProtect(pages.0.add(4096).cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old),
+                        }
+                    };
+                };
+                let after = |pages: &Pages| {
+                    let at = pages.0.addr() + 4096;
+                    if how == "guarded" {
+                        assert!(guarded(at), "{what}: the guard flag was consumed");
+                    }
+                    let mut old = 0;
+                    // SAFETY: as above; then the pages can be read.
+                    let there = unsafe {
+                        VirtualAlloc(at as *mut _, 4096, MEM_COMMIT, PAGE_READWRITE);
+                        VirtualProtect(at as *mut _, 4096, PAGE_READWRITE, &mut old);
+                        std::slice::from_raw_parts(pages.0, 8192)
+                    };
+                    assert_eq!(there[..4096], now[..4096], "{what}: the first page");
+                    assert!(there[4096..].iter().all(|&b| b == 0), "{what}: stored in the second page");
+                };
+
+                let pages = Pages::new(2 << 12);
+                second(&pages);
+                let mut held = vec![0u8; 8192];
+                let mut counts = [0u64; 2];
+                let merge = if plain { victory_safe_merge_plain } else { victory_safe_merge };
+                // SAFETY: our allocation, whose faults leave through the
+                // failing exits, and our vectors.
+                let left = unsafe { merge(pages.0, now.as_ptr(), held.as_mut_ptr(), blocks, &mut counts) };
+                assert_eq!(left, blocks / 2, "{what}: merge");
+                assert_eq!(counts, [128, 128], "{what}: merge's counts");
+                assert_eq!(held[..4096], now[..4096], "{what}: held");
+                assert!(held[4096..].iter().all(|&b| b == 0), "{what}: held of the second page");
+                after(&pages);
+
+                let pages = Pages::new(2 << 12);
+                second(&pages);
+                let was = vec![0u8; 8192];
+                let put = if plain { victory_safe_put_plain } else { victory_safe_put };
+                // SAFETY: as above.
+                assert_eq!(unsafe { put(pages.0, was.as_ptr(), now.as_ptr(), blocks) }, 0, "{what}: put");
+                after(&pages);
             }
         }
     }
