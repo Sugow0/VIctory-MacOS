@@ -10,6 +10,11 @@
 //! [`crate::watch`] (`on_write`, the first in the process), which opens a
 //! block we guard ourselves and lets the copy go on, and otherwise sends it
 //! to its failing exit. `VICTORY_SAFE_COPY=0`: through the kernel, as before.
+//!
+//! [`put_changed`] and [`merge`] store the dwords of a block that change as
+//! one masked store (`vpmaskmovd`), or one by one under Wine
+//! ([`plain_stores`], `VICTORY_SAFE_STORES`): Rosetta does not deliver a
+//! fault in a masked store, and the process hangs.
 
 use std::sync::OnceLock;
 
@@ -134,6 +139,166 @@ std::arch::global_asm!(
     "mov qword ptr [rax + 8], r11",
     "mov rax, r9",
     "ret",
+    ".globl victory_safe_put_plain",
+    ".globl victory_safe_put_plain_at",
+    ".globl victory_safe_put_plain_after",
+    // As victory_safe_put, the dwords stored one by one from a general
+    // register and not by one masked store (see [`plain_stores`]); a fault
+    // leaves through victory_safe_put_failed.
+    "victory_safe_put_plain:",
+    "test r9, r9",
+    "jz 4f",
+    "2:",
+    "vmovdqu ymm1, ymmword ptr [r8]",
+    "vpcmpeqd ymm2, ymm1, ymmword ptr [rdx]",
+    "vmovmskps eax, ymm2",
+    "xor eax, 255",
+    "jz 3f",
+    "vextracti128 xmm2, ymm1, 1",
+    "victory_safe_put_plain_at:",
+    "test al, 1",
+    "jz 20f",
+    "vmovd r10d, xmm1",
+    "mov dword ptr [rcx], r10d",
+    "20:",
+    "test al, 2",
+    "jz 21f",
+    "vpextrd r10d, xmm1, 1",
+    "mov dword ptr [rcx + 4], r10d",
+    "21:",
+    "test al, 4",
+    "jz 22f",
+    "vpextrd r10d, xmm1, 2",
+    "mov dword ptr [rcx + 8], r10d",
+    "22:",
+    "test al, 8",
+    "jz 23f",
+    "vpextrd r10d, xmm1, 3",
+    "mov dword ptr [rcx + 12], r10d",
+    "23:",
+    "test al, 16",
+    "jz 24f",
+    "vmovd r10d, xmm2",
+    "mov dword ptr [rcx + 16], r10d",
+    "24:",
+    "test al, 32",
+    "jz 25f",
+    "vpextrd r10d, xmm2, 1",
+    "mov dword ptr [rcx + 20], r10d",
+    "25:",
+    "test al, 64",
+    "jz 26f",
+    "vpextrd r10d, xmm2, 2",
+    "mov dword ptr [rcx + 24], r10d",
+    "26:",
+    "test al, 128",
+    "jz 27f",
+    "vpextrd r10d, xmm2, 3",
+    "mov dword ptr [rcx + 28], r10d",
+    "27:",
+    "victory_safe_put_plain_after:",
+    "3:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "vzeroupper",
+    "4:",
+    "mov eax, 1",
+    "ret",
+    ".globl victory_safe_merge_plain",
+    ".globl victory_safe_merge_plain_at",
+    ".globl victory_safe_merge_plain_after",
+    ".globl victory_safe_merge_plain_failed",
+    // As victory_safe_merge, the dwords of a block only partly stored one by
+    // one from a general register and not by one masked store (see
+    // [`plain_stores`]). That register is r10, kept meanwhile in xmm5, which
+    // the failing exit here gives back before the common one.
+    "victory_safe_merge_plain:",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "test r9, r9",
+    "jz 6f",
+    "2:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
+    "vpmovmskb eax, ymm1",
+    "cmp eax, -1",
+    "je 5f",
+    "vmovq xmm5, r10",
+    "victory_safe_merge_plain_at:",
+    "vmovdqu ymm2, ymmword ptr [rcx]",
+    "vpblendvb ymm3, ymm0, ymm2, ymm1",
+    "vpcmpeqd ymm4, ymm3, ymm2",
+    "vmovmskps eax, ymm4",
+    "xor eax, 255",
+    "jz 4f",
+    "cmp eax, 255",
+    "je 3f",
+    "vextracti128 xmm4, ymm3, 1",
+    "test al, 1",
+    "jz 20f",
+    "vmovd r10d, xmm3",
+    "mov dword ptr [rcx], r10d",
+    "20:",
+    "test al, 2",
+    "jz 21f",
+    "vpextrd r10d, xmm3, 1",
+    "mov dword ptr [rcx + 4], r10d",
+    "21:",
+    "test al, 4",
+    "jz 22f",
+    "vpextrd r10d, xmm3, 2",
+    "mov dword ptr [rcx + 8], r10d",
+    "22:",
+    "test al, 8",
+    "jz 23f",
+    "vpextrd r10d, xmm3, 3",
+    "mov dword ptr [rcx + 12], r10d",
+    "23:",
+    "test al, 16",
+    "jz 24f",
+    "vmovd r10d, xmm4",
+    "mov dword ptr [rcx + 16], r10d",
+    "24:",
+    "test al, 32",
+    "jz 25f",
+    "vpextrd r10d, xmm4, 1",
+    "mov dword ptr [rcx + 20], r10d",
+    "25:",
+    "test al, 64",
+    "jz 26f",
+    "vpextrd r10d, xmm4, 2",
+    "mov dword ptr [rcx + 24], r10d",
+    "26:",
+    "test al, 128",
+    "jz 27f",
+    "vpextrd r10d, xmm4, 3",
+    "mov dword ptr [rcx + 28], r10d",
+    "27:",
+    "vmovq r10, xmm5",
+    "jmp 7f",
+    "3:",
+    "vmovdqu ymmword ptr [rcx], ymm3",
+    "victory_safe_merge_plain_after:",
+    "7:",
+    "popcnt eax, eax",
+    "add r11, rax",
+    "4:",
+    "inc r10",
+    "vmovdqu ymmword ptr [r8], ymm0",
+    "5:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "6:",
+    "jmp victory_safe_merge_failed",
+    "victory_safe_merge_plain_failed:",
+    "vmovq r10, xmm5",
+    "jmp victory_safe_merge_failed",
     ".globl victory_safe_changed",
     ".globl victory_safe_changed_at",
     ".globl victory_safe_changed_after",
@@ -186,6 +351,13 @@ unsafe extern "system" {
     fn victory_safe_merge_at();
     fn victory_safe_merge_after();
     fn victory_safe_merge_failed();
+    fn victory_safe_put_plain(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32;
+    fn victory_safe_put_plain_at();
+    fn victory_safe_put_plain_after();
+    fn victory_safe_merge_plain(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge_plain_at();
+    fn victory_safe_merge_plain_after();
+    fn victory_safe_merge_plain_failed();
     fn victory_safe_changed(title: *const u8, seen: *mut u8, records: usize, bits: *mut u64) -> u32;
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
@@ -237,6 +409,7 @@ pub(crate) struct Merged {
 /// [`copy`]'s. The stretch lies in one page of 4 KiB of title memory. [`on`]
 /// must have been asked.
 pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+    let victory_safe_merge = if plain_stores() { victory_safe_merge_plain } else { victory_safe_merge };
     let mut out = Merged { there: true, ..Merged::default() };
     let mut at = 0;
     while at < len {
@@ -353,9 +526,10 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     let tail = head + blocks * 32;
     let mut all = true;
     if blocks > 0 {
+        let put = if plain_stores() { victory_safe_put_plain } else { victory_safe_put };
         // SAFETY: the two slices hold the blocks; the destination's faults
         // leave through the failing exit.
-        all &= unsafe { victory_safe_put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
+        all &= unsafe { put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
     }
     let single = |from: usize, to: usize| {
         let mut all = true;
@@ -374,6 +548,32 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     all &= single(0, head);
     all &= single(tail, n);
     all
+}
+
+/// Whether [`put_changed`] and [`merge`] store the dwords that change one by
+/// one, from a general register, and not as one masked store (`vpmaskmovd`).
+/// Under Rosetta (Wine on Apple silicon) a fault in a masked store is not
+/// delivered to our handler ("unexpectedly need to EmulateForward on a
+/// synchronous exception") and the process hangs; one in a plain store is.
+/// `VICTORY_SAFE_STORES=plain` or `=masked` chooses; by default plain under
+/// Wine (ntdll exports `wine_get_version`), masked elsewhere.
+fn plain_stores() -> bool {
+    static PLAIN: OnceLock<bool> = OnceLock::new();
+    *PLAIN.get_or_init(|| match std::env::var_os("VICTORY_SAFE_STORES") {
+        Some(v) if v == "plain" => true,
+        Some(v) if v == "masked" => false,
+        _ => on_wine(),
+    })
+}
+
+/// Whether we run under Wine: its ntdll exports `wine_get_version`.
+fn on_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookups in ntdll, always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
 }
 
 /// Whether copies are made here and not by the kernel.
@@ -411,6 +611,14 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_put_at as *const () as usize, victory_safe_put_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_put_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_put_plain_at as *const () as usize, victory_safe_put_plain_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_put_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_merge_plain_at as *const () as usize, victory_safe_merge_plain_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_merge_plain_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_changed_at as *const () as usize, victory_safe_changed_after as *const () as usize);
     if (from..to).contains(&at) {
@@ -715,6 +923,47 @@ mod tests {
                 w.join().expect("no write was undone");
             }
         });
+    }
+
+    /// The stores one by one ([`plain_stores`]) leave title memory, what was
+    /// held and the counts as the masked ones do, on memory that is there
+    /// (a fault in a masked store would hang under Rosetta).
+    #[test]
+    fn plain_stores_do_what_masked_ones_do() {
+        let (a, b) = (Pages::new(1 << 12), Pages::new(1 << 12));
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..2000u32 {
+            let title: Vec<u8> = (0..4096).map(|_| random() as u8).collect();
+            let was: Vec<u8> = (0..4096).map(|_| random() as u8).collect();
+            let mut now = was.clone();
+            for _ in 0..random() % 200 {
+                let i = random() as usize % 4096;
+                now[i] = if round % 2 == 0 { title[i] } else { random() as u8 };
+            }
+            let blocks = 4096 / 32;
+            let (mut held_a, mut held_b) = (was.clone(), was.clone());
+            let (mut counts_a, mut counts_b) = ([0u64; 2], [0u64; 2]);
+            // SAFETY: our allocations and vectors, 4096 bytes each.
+            unsafe {
+                std::ptr::copy_nonoverlapping(title.as_ptr(), a.0, 4096);
+                std::ptr::copy_nonoverlapping(title.as_ptr(), b.0, 4096);
+                assert_eq!(victory_safe_merge(a.0, now.as_ptr(), held_a.as_mut_ptr(), blocks, &mut counts_a), 0);
+                assert_eq!(victory_safe_merge_plain(b.0, now.as_ptr(), held_b.as_mut_ptr(), blocks, &mut counts_b), 0);
+                assert_eq!(std::slice::from_raw_parts(a.0, 4096), std::slice::from_raw_parts(b.0, 4096), "merge, round {round}");
+                assert_eq!((held_a, counts_a), (held_b, counts_b), "merge, round {round}");
+                std::ptr::copy_nonoverlapping(title.as_ptr(), a.0, 4096);
+                std::ptr::copy_nonoverlapping(title.as_ptr(), b.0, 4096);
+                assert_ne!(victory_safe_put(a.0, was.as_ptr(), now.as_ptr(), blocks), 0);
+                assert_ne!(victory_safe_put_plain(b.0, was.as_ptr(), now.as_ptr(), blocks), 0);
+                assert_eq!(std::slice::from_raw_parts(a.0, 4096), std::slice::from_raw_parts(b.0, 4096), "put, round {round}");
+            }
+        }
     }
 
     #[test]
