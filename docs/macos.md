@@ -36,8 +36,8 @@ D3DMetal do with victory.exe is not. Known risks:
   with 4 KiB dirty bits and 64 KiB views is unknown.
 - **FXC.** A few host shaders are compiled at run time with `D3DCompile`
   (`inplace.rs`, `host.rs`), which needs `d3dcompiler_47.dll` in the prefix.
-  Wine has its own builtin; if it refuses those shaders, a native
-  `d3dcompiler_47.dll` is needed.
+  Wine's builtin (vkd3d) refuses 8 of them, so Microsoft's is put in the
+  prefix (see "Microsoft's d3dcompiler_47" below).
 - **AVX2 under Rosetta.** victory.exe is built for AVX2 and checks it by
   cpuid. The sources disagree, and none of this is tested here:
   AppleGamingWiki has Rosetta's AVX2 from macOS 15.0; Apple's developer
@@ -88,6 +88,67 @@ Try `--safe` first.
   script prints the path. A victory.exe built on Windows (README.md) and
   copied to `target/diag/victory.exe` here also works: the launcher uses it
   when the first one is missing.
+
+## Microsoft's d3dcompiler_47
+
+Wine's builtin `d3dcompiler_47` (vkd3d) rejects `InterlockedAdd`/`InterlockedOr`
+on `RWByteAddressBuffer`, `GetDimensions` on `RWTexture2D`/`RWTexture3D` and
+`Load4` in the runtime's internal HLSL shaders (indirect, ambient,
+lightprobe; issue #16). Once per prefix or bottle:
+
+```sh
+brew install osslsigncode
+scripts/macos-setup-bottle.sh --bottle <bottle>   # CrossOver
+scripts/macos-setup-bottle.sh                     # Wine/GPTK: WINEPREFIX, by default ~/.victory-wine
+```
+
+It picks Wine as the launcher does, refuses a bottle when the Wine picked is
+not CrossOver, and asks CrossOver where the bottle is (`winepath`; else
+`CX_BOTTLE_PATH`, by default `~/Library/Application Support/CrossOver/Bottles`).
+It needs a 64-bit prefix (`syswow64` present), downloads nothing when the
+DLL in place is already the one below, downloads to a temporary folder
+otherwise, and stops on any mismatch. `--dry-run` prints what it would do.
+`osslsigncode` fetches the certificates' revocation lists (CRLs) over
+http, so the signature check fails offline or behind a proxy that blocks
+them.
+
+- Source: the Windows SDK 10.0.26100.9457 (September 2026 servicing), as
+  Visual Studio's installer manifest lists it (package
+  `Win11SDK_10.0.26100`, msi "Windows SDK for Windows Store Apps
+  Tools-x86_en-us.msi"), from Microsoft's
+  `https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/61d57a7a82309cd161a854a6f4619e52.cab`,
+  SHA-256 `6ef3e512e5cab49a3f5f0dff57408fb81d29ea591a194f6e5978f87750af21c2`
+  (the manifest's).
+- The DLL, member `fil3585cb2ea5db13cc0838f8d06b5c9679` of that cab:
+  `d3dcompiler_47.dll` 10.0.26100.9457, "Direct3D HLSL Compiler for
+  Redistribution", PE32+ x86-64, SHA-256
+  `1da540a0ddbc54de4142570c8ec4a4566ef610fce72c181efb55a9332c480790`.
+  Its Authenticode signature (signer Microsoft Corporation, issued by
+  Microsoft Windows Code Signing PCA 2024) is checked with `osslsigncode`
+  up to Microsoft Root Certificate Authority 2010, fetched from
+  `https://www.microsoft.com/pki/certs/MicRooCerAut_2010-06-23.crt` and
+  pinned by its SHA-256
+  (`df545bf919a2439c36983b54cdfc903dfa4f37d3996d8d84b4c31eec6f3c163e`).
+- It goes to `drive_c/windows/system32/d3dcompiler_47.dll` (Wine's builtin
+  kept once as `d3dcompiler_47.dll.builtin.bak`), with the override
+  `HKCU\Software\Wine\DllOverrides` `d3dcompiler_47` = `native`.
+- The DLL is Microsoft's, under the Windows SDK's license terms; it is not in
+  this repository and is not redistributed by it.
+
+To undo (CrossOver, `wine` being
+`CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`; elsewhere
+`WINEPREFIX=<prefix> wine64` in place of `wine --bottle <bottle>`, and the
+prefix's own `drive_c/windows/system32`):
+
+```sh
+cd "$HOME/Library/Application Support/CrossOver/Bottles/<bottle>/drive_c/windows/system32"
+if [ -f d3dcompiler_47.dll.builtin.bak ]; then
+    mv d3dcompiler_47.dll.builtin.bak d3dcompiler_47.dll
+else
+    rm d3dcompiler_47.dll   # there was no builtin file to keep; Wine uses its own
+fi
+wine --bottle <bottle> reg delete 'HKCU\Software\Wine\DllOverrides' /v d3dcompiler_47 /f
+```
 
 ## Running
 
