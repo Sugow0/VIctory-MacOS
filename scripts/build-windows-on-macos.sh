@@ -24,13 +24,35 @@ for arg in "$@"; do
         *) cargo_args+=("$arg") ;;
     esac
 done
+# Arguments replace the defaults; the target is always $TARGET.
 if [ "${#cargo_args[@]}" -eq 0 ]; then
     cargo_args=(--locked --profile diag -p victory --features diagnostics)
 fi
 
+# Where the exe lands: profile and target dir, read from the args.
+profile=debug
+target_dir="${CARGO_TARGET_DIR:-target}"
+prev=
+for arg in "${cargo_args[@]}"; do
+    case "$prev" in
+        --profile) profile="$arg" ;;
+        --target-dir) target_dir="$arg" ;;
+    esac
+    case "$arg" in
+        -r|--release) profile=release ;;
+        --profile=*) profile="${arg#--profile=}" ;;
+        --target-dir=*) target_dir="${arg#--target-dir=}" ;;
+        --target|--target=*) die "the target is always $TARGET; drop $arg" ;;
+    esac
+    prev="$arg"
+done
+if [ "$profile" = dev ]; then profile=debug; fi
+
 # rustup's cargo honors rust-toolchain.toml; Homebrew's cargo does not.
 [ -x "$HOME/.cargo/bin/cargo" ] || die "rustup's cargo not found in ~/.cargo/bin (install rustup)"
 export PATH="$HOME/.cargo/bin:$PATH"
+# Either would bypass rustup's pick of the toolchain pinned in rust-toolchain.toml.
+unset RUSTC RUSTUP_TOOLCHAIN
 
 # clang-cl, llvm-lib, llvm-ar, llvm-rc come from Homebrew llvm; lld-link from Homebrew lld.
 brew_prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
@@ -40,8 +62,12 @@ lld_bin="$brew_prefix/opt/lld/bin"
 [ -x "$lld_bin/lld-link" ] || die "lld-link not found in $lld_bin (brew install lld)"
 export PATH="$llvm_bin:$lld_bin:$PATH"
 
-if ! cargo xwin --version >/dev/null 2>&1; then
+if ! command -v cargo-xwin >/dev/null 2>&1; then
     die "cargo-xwin is missing: run  ~/.cargo/bin/cargo install --locked cargo-xwin"
+fi
+if ! xwin_version="$(cargo xwin --version 2>&1)"; then
+    echo "$xwin_version" >&2
+    die "cargo-xwin is installed but 'cargo xwin --version' failed (output above)"
 fi
 
 if [ "$accept_license" = 1 ]; then
@@ -56,23 +82,10 @@ EOF
     exit 1
 fi
 
-rustup target list --installed | grep -qx "$TARGET" || rustup target add "$TARGET"
-
+# rust-toolchain.toml lists the target, so rustup installs it when needed.
 cargo xwin build --target "$TARGET" "${cargo_args[@]}"
 
-# Report where the exe landed, from the profile in the args.
-profile=debug
-prev=
-for arg in "${cargo_args[@]}"; do
-    case "$arg" in
-        --release) profile=release ;;
-        --profile=*) profile="${arg#--profile=}" ;;
-    esac
-    [ "$prev" = "--profile" ] && profile="$arg"
-    prev="$arg"
-done
-[ "$profile" = dev ] && profile=debug
-exe="target/$TARGET/$profile/victory.exe"
+exe="$target_dir/$TARGET/$profile/victory.exe"
 if [ -f "$exe" ]; then
     echo "built: $(cd "$(dirname "$exe")" && pwd)/victory.exe"
 else
