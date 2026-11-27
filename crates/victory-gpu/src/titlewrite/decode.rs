@@ -623,10 +623,28 @@ mod tests {
         // SAFETY: our word.
         assert!(unsafe { store.run(&mut c, &raw mut ours as usize) });
         assert_eq!(ours, memory, "{code:x?} of {there:x} with {operand:x}");
-        assert_eq!((c.Rdx, c.Rax), (out[1], out[2]), "{code:x?} of {there:x} with {operand:x}, {compared:x}");
+        let rosetta = rosetta_cmpxchg(code);
+        // (Rosetta clears the top of rax when a 4 byte one finds it equal.)
+        let rax = if rosetta && store.size == 4 { u64::from(u32::MAX) } else { u64::MAX };
+        assert_eq!((c.Rdx, c.Rax & rax), (out[1], out[2] & rax), "{code:x?} of {there:x} with {operand:x}, {compared:x}");
         // (`and`, `or` and `xor` leave AF as they like.)
         const SEEN: u32 = CF | PF | ZF | SF | OF;
-        assert_eq!(c.EFlags & SEEN, out[0] as u32 & SEEN, "{code:x?} of {there:x} with {operand:x}");
+        let seen = if rosetta { ZF } else { SEEN };
+        assert_eq!(c.EFlags & seen, out[0] as u32 & seen, "{code:x?} of {there:x} with {operand:x}");
+    }
+
+    /// Whether `code` is a `cmpxchg` (0f b0, 0f b1) run under Wine, that is
+    /// under Rosetta 2 on Apple silicon, which does it otherwise than the
+    /// processor (issue #15), in all sizes, locked or not: it leaves the
+    /// flags of `cmp [mem], accumulator` and not of `cmp accumulator, [mem]`
+    /// (al 80h against 0: CF, OF and SF, 881h, where the processor leaves
+    /// SF, 80h), and a 4 byte one that finds eax equal clears the top of rax,
+    /// which the processor keeps. Of those only ZF is compared (the same
+    /// either way, and what code after a `cmpxchg` looks at) and the low 4
+    /// bytes of rax; the memory and the other register in full. Nothing of
+    /// the runtime takes them from Rosetta: [`Store::run`] makes them itself.
+    fn rosetta_cmpxchg(code: &[u8]) -> bool {
+        code.windows(2).any(|w| w[0] == 0x0f && w[1] & 0xfe == 0xb0) && crate::safecopy::on_wine()
     }
 
     #[test]
