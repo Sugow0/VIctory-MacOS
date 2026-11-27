@@ -85,16 +85,24 @@ alone, `emit::host::on_d3dmetal`: under Wine with that adapter name):
   i or j, P10 or P20, a lone `v_interp_p1_f32`). On D3DMetal
   (`emit::set_host_derived_vertices`, set from `on_d3dmetal` in
   `crates/victory-gpu/src/host.rs`, part of the translation fingerprint)
-  such a float attribute is declared perspective-interpolated instead and
-  its vertices are derived from it: A = P0 + i (P1 - P0) + j (P2 - P0), so
-  the fine derivatives of A, i and j across the quad give P1 - P0 and
-  P2 - P0, and P0 = A - i (P1 - P0) - j (P2 - P0)
-  (`Lower::derived_vertices`). Exact in real numbers; in floats the error
-  grows with the triangle's size in pixels (about 4e-5 of the value on an
-  8x8 test with one vertex at w = 3). Integer and 16-bit attributes still
-  use `attributeAtVertex` (wrong there). Elsewhere the DXIL is unchanged.
-  The barycentrics tests run on D3DMetal with the vertices derived only,
-  elsewhere both ways.
+  such a float attribute is declared interpolated instead, with a kind of
+  barycentrics the program already declares (perspective center if none,
+  so no third kind is needed), and its vertices are derived from it:
+  A = P0 + i (P1 - P0) + j (P2 - P0), so the fine derivatives of A, i and j
+  across the quad give P1 - P0 and P2 - P0, and
+  P0 = A - i (P1 - P0) - j (P2 - P0) (`Lower::derived_vertices`). On a line
+  (j = 0) P1 - P0 comes from i alone, on a point P0 = A. Exact in real
+  numbers. In floats A's change across a pixel is rounded to A's
+  precision, so the vertices are off by about an ulp of |A| times the
+  triangle's size in pixels: about 4e-5 of the value on an 8x8 test with
+  one vertex at w = 3, but a large value changing little per pixel is
+  grossly off (1e5, an ulp of 0.008, over 100 pixels: about 1), so an id
+  or index read per vertex is not exact. P0, read flat and exact before,
+  is derived too on such a row: one input element has one interpolation
+  mode, and the vertex shader's output cannot be read twice. Integer and
+  16-bit attributes still use `attributeAtVertex` (wrong there). Elsewhere
+  the DXIL is unchanged. The barycentrics tests run on D3DMetal with the
+  vertices derived only, elsewhere both ways.
 - **Sine and cosine of NaN** give a number (sin(NaN) = 0 in f32 and f16)
   where D3D12 and the console give NaN, likely Metal's fast math. The tests
   leave infinities unchecked there too; finite inputs are right.
