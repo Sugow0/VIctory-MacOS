@@ -16,10 +16,11 @@
 # target dirs kept between runs; default ~/Library/Caches/victory-verify).
 # Exit status: 0 passed, 1 a test or stage failed, 2 could not run.
 # Written for macOS's own /bin/bash (3.2): no associative arrays, no mapfile.
-set -euo pipefail
+set -Eeuo pipefail
 export LC_ALL=C
 # A command that fails unexpectedly (set -e) means the run could not be made,
 # not that a test failed: exit 2, which the agent retries.
+# (-E: in functions too.)
 trap 'echo "verify-macos: aborted at line $LINENO" >&2; exit 2' ERR
 
 # Failures under Wine that come from the bottle, not from the code, as

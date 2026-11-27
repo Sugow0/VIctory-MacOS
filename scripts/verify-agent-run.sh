@@ -46,12 +46,21 @@ if ! mkdir "$lock" 2>/dev/null; then
         echo "$(stamp) run $owner holds $lock; nothing done"
         exit 0
     fi
+    # No pid yet: its owner may be writing it.
+    if [ -z "$owner" ] && [ -z "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        echo "$(stamp) $lock is being taken; nothing done"
+        exit 0
+    fi
     rm -rf "$lock"
     mkdir "$lock" 2>/dev/null || { echo "$(stamp) $lock taken meanwhile; nothing done"; exit 0; }
 fi
 echo $$ >"$lock/pid"
+child=''
 trap 'rm -rf "$lock"' EXIT
-trap 'exit 2' INT TERM HUP
+# A signal reaches verify-macos.sh too, so that it removes its worktree and
+# lock (bash runs a trap only once its foreground child is done: hence the
+# child in the background and `wait`).
+trap '[ -z "$child" ] || { kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; }; exit 2' INT TERM HUP
 
 git -C "$repo" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" \
     || cannot "git fetch origin failed (from $repo)"
@@ -65,7 +74,10 @@ fi
 log_dir="$state/logs/$(date +%Y%m%d-%H%M%S)-${sha:0:10}"
 echo "$(stamp) verifying origin/$branch ${sha:0:10} (last verified: ${last:-none}); logs $log_dir"
 status=0
-"$script_dir/verify-macos.sh" --ref "$sha" --log-dir "$log_dir" >"$log_dir.log" 2>&1 || status=$?
+"$script_dir/verify-macos.sh" --ref "$sha" --log-dir "$log_dir" >"$log_dir.log" 2>&1 </dev/null &
+child=$!
+wait "$child" || status=$?
+child=''
 mkdir -p "$log_dir"
 mv "$log_dir.log" "$log_dir/verify.log" 2>/dev/null || true
 # A pass is a status of 0 and the summary's PASSED line.
