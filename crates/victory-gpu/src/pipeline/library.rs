@@ -812,6 +812,13 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
+        if victory_shader::emit::host::on_d3dmetal() {
+            // (it reports libraries, D3D12_SHADER_CACHE_SUPPORT_LIBRARY, and
+            // refuses to make even an empty one: docs/macos.md)
+            assert!(open(&device, Blob::Held(b"not a pipeline library".repeat(16))).is_none());
+            eprintln!("D3DMetal makes no pipeline libraries; the runtime goes without");
+            return;
+        }
         let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16))).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
