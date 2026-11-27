@@ -6,8 +6,13 @@
 //! the frame's start (`WaitFrameEventX`), clears the target, submits the
 //! list and presents the target (`PresentX`). After N frames it returns.
 //!
-//! Arguments (after `--` on `victory run`): `[frames] [exit code]`, default
-//! 600 (10 s at 60 Hz: the frame meter logs every 5 s) and 0. A failed
+//! Arguments (after `--` on `victory run`): `[frames] [exit code] [clears]
+//! [copies]`, default 600 (10 s at 60 Hz: the frame meter logs every 5 s),
+//! 0, 0 and 0. `clears` adds that many more clears of the target to each
+//! frame's list; `copies` that many copies of the target into a second
+//! texture, each between two barriers (a load for measuring per-command
+//! cost: draws would need a console shader blob, which nothing here
+//! makes). A failed
 //! step returns 10 + the step instead (10-24; a null device is 24), so
 //! callers that pass an exit code keep below 10.
 //!
@@ -92,6 +97,17 @@ struct DescriptorHeapDesc {
     placement: [u64; 2],
 }
 
+/// A transition barrier (`D3D12_RESOURCE_BARRIER`, its transition arm).
+#[repr(C)]
+struct Barrier {
+    kind: u32,
+    flags: u32,
+    resource: This,
+    subresource: u32,
+    before: u32,
+    after: u32,
+}
+
 /// A present plane: the frame's token and the resources shown.
 #[repr(C)]
 struct Plane {
@@ -153,6 +169,9 @@ const TEXTURE_2D: u32 = 3;
 const ALLOW_RENDER_TARGET: u32 = 1;
 const DEFAULT_HEAP: u32 = 1;
 const RENDER_TARGET: u32 = 4;
+const COPY_DEST: u32 = 0x400;
+const COPY_SOURCE: u32 = 0x800;
+const ALL_SUBRESOURCES: u32 = 0xffff_ffff;
 const FRAME_ORIGIN: u32 = 0;
 const SIXTIETH_US: u32 = 16_667;
 
@@ -188,8 +207,16 @@ fn number(text: *const c_char) -> Option<u32> {
     }
 }
 
-/// `[frames] [exit code]` from the title's arguments.
-fn arguments() -> (u32, u32) {
+/// The title's arguments.
+struct Arguments {
+    frames: u32,
+    code: u32,
+    clears: u32,
+    copies: u32,
+}
+
+/// `[frames] [exit code] [clears] [copies]` from the title's arguments.
+fn arguments() -> Arguments {
     // SAFETY: the runtime's argument accessors; `argv[argc]` is null.
     let (argc, argv) = unsafe { (*__p___argc(), *__p___argv()) };
     // SAFETY: as above, `argc` entries.
@@ -198,7 +225,12 @@ fn arguments() -> (u32, u32) {
             .then(|| unsafe { *argv.add(i as usize) })
             .and_then(|a| number(a))
     };
-    (arg(1).unwrap_or(600), arg(2).unwrap_or(0))
+    Arguments {
+        frames: arg(1).unwrap_or(600),
+        code: arg(2).unwrap_or(0),
+        clears: arg(3).unwrap_or(0),
+        copies: arg(4).unwrap_or(0),
+    }
 }
 
 /// Fails with 10 + `step` when `hr` is a failure.
@@ -206,7 +238,7 @@ fn check(hr: Hr, step: u32) -> Result<(), u32> {
     if hr < 0 { Err(10 + step) } else { Ok(()) }
 }
 
-fn run(frames: u32) -> Result<(), u32> {
+fn run(args: &Arguments) -> Result<(), u32> {
     // SAFETY: the console's API, as titles call it; every object is ours
     // from the call that made it, and lives until the process ends.
     unsafe {
@@ -290,6 +322,26 @@ fn run(frames: u32) -> Result<(), u32> {
             3,
         )?;
 
+        // The copies' destination, only made when there are copies (a
+        // default run makes what it always made).
+        let mut copy: This = null();
+        if args.copies > 0 {
+            let copy_desc = ResourceDesc { flags: 0, ..desc };
+            check(
+                method::<Committed>(device, 0xd8)(
+                    device,
+                    &heap,
+                    0,
+                    &copy_desc,
+                    COPY_DEST,
+                    null(),
+                    &IID_RESOURCE,
+                    &mut copy,
+                ),
+                3,
+            )?;
+        }
+
         let heap_desc = DescriptorHeapDesc {
             kind: RTV_HEAP,
             count: 1,
@@ -357,11 +409,13 @@ fn run(frames: u32) -> Result<(), u32> {
             list, 0x1a0,
         );
         let close = method::<extern "system" fn(This) -> Hr>(list, 0x48);
+        let barrier = method::<extern "system" fn(This, u32, *const Barrier)>(list, 0xd0);
+        let copy_resource = method::<extern "system" fn(This, This, This)>(list, 0x88);
         let execute = method::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
         type Present = extern "system" fn(This, u32, *const Plane, *const u8) -> Hr;
         let present = method::<Present>(queue, 0xf0);
 
-        for frame in 0..frames {
+        for frame in 0..args.frames {
             let mut token = 0u64;
             check(wait(device, FRAME_ORIGIN, 100, null(), 0, &mut token), 9)?;
             check(reset_allocator(allocator), 10)?;
@@ -370,6 +424,22 @@ fn run(frames: u32) -> Result<(), u32> {
             let t = (frame % 120) as f32 / 120.0;
             let color = [t, 0.25, 1.0 - t, 1.0];
             clear_rtv(list, rtv, &color, 0, null());
+            for _ in 0..args.clears {
+                clear_rtv(list, rtv, &color, 0, null());
+            }
+            let transition = |before, after| Barrier {
+                kind: 0,
+                flags: 0,
+                resource: target,
+                subresource: ALL_SUBRESOURCES,
+                before,
+                after,
+            };
+            for _ in 0..args.copies {
+                barrier(list, 1, &transition(RENDER_TARGET, COPY_SOURCE));
+                copy_resource(list, copy, target);
+                barrier(list, 1, &transition(COPY_SOURCE, RENDER_TARGET));
+            }
             check(close(list), 12)?;
             execute(queue, 1, &list);
             let plane = Plane {
@@ -387,9 +457,9 @@ fn run(frames: u32) -> Result<(), u32> {
 /// is the title's exit code.
 #[unsafe(no_mangle)]
 pub extern "system" fn smoke_main(_: *mut c_void) -> u32 {
-    let (frames, code) = arguments();
-    match run(frames) {
-        Ok(()) => code,
+    let args = arguments();
+    match run(&args) {
+        Ok(()) => args.code,
         Err(failed) => failed,
     }
 }
