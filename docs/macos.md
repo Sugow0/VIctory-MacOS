@@ -50,6 +50,52 @@ D3DMetal do with victory.exe is not. Known risks:
 
 Try `--safe` first.
 
+## Known limits of D3DMetal
+
+Seen with CrossOver 26.3's D3DMetal on Apple silicon through the crate tests
+(`victory-shader`, `victory-gpu`) run under Wine. Its device shows as
+"AMD Compatibility Mode" (vendor 0x1002, device 0x66af) and reports SM 6.6,
+wave operations with `WaveLaneCountMin` = `WaveLaneCountMax` = 32,
+`DoublePrecisionFloatShaderOps` = 0, `Int64ShaderOps` = 1,
+`Native16BitShaderOpsSupported` = 1, `BarycentricsSupported` = 1 and
+shader cache support 0x1e (libraries included).
+
+What the runtime chooses from a capability it reports:
+
+- **Waves of 64.** D3DMetal takes a pipeline asking for `WaveSize(64)` and
+  runs it wrong (zeros), where NVIDIA's driver refuses it. The runtime sets
+  the translator's widest host wave from `WaveLaneCountMax`
+  (`crates/victory-gpu/src/host.rs`); a console wave64 program that cannot
+  run in waves of 32 is refused by the translator (`emit::emit`,
+  `WIDER_THAN_HOST`), and the test host refuses a wave size outside the
+  device's (`emit::host::Host::compute_pipeline_with`).
+- **Doubles.** `DoublePrecisionFloatShaderOps` is 0 and a double addition
+  gives 0. The tests skip double arithmetic on such a device; the translator
+  does not refuse console f64 code there (`v_add_f64` and the like): those
+  programs compute wrong.
+
+What it reports and does otherwise (the tests skip these checks on D3DMetal
+alone, `emit::host::on_d3dmetal`: under Wine with that adapter name):
+
+- **Barycentrics.** Reported, but a pixel shader reading `SV_Barycentrics`
+  with an attribute per vertex (`GetAttributeAtVertex`, the translation of
+  a lone `v_interp_p1_f32`) gives 0. Not worked around: the attributes of
+  the three vertices would have to reach the pixel shader another way (a
+  geometry or mesh stage passing them per primitive).
+- **Sine and cosine of NaN** give a number (sin(NaN) = 0 in f32 and f16)
+  where D3D12 and the console give NaN, likely Metal's fast math. The tests
+  leave infinities unchecked there too; finite inputs are right.
+- **A texture store and then an atomic on the same texel in one thread**
+  leave the stored value (9 where 9 + 1 is due): the atomic is lost or done
+  first. Not worked around (a fence between them would cost every host).
+- **Pipeline libraries.** Reported, and `CreatePipelineLibrary` refuses even
+  an empty blob (0x887E0002, `D3D12_ERROR_DRIVER_VERSION_MISMATCH`). The
+  runtime goes without a library: every pipeline is made by the driver.
+- **No validation.** A container with an all-zero DXIL hash makes a
+  pipeline, and `D3D12CreateRootSignatureDeserializer` takes a truncated
+  root signature (`S_OK`): a damaged blob is not caught there as on
+  Windows.
+
 ## What you need
 
 - A Mac with Apple silicon, macOS 15 (Sequoia) or later, 15.4 or later
