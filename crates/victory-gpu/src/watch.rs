@@ -2118,7 +2118,9 @@ fn recording() -> bool {
 /// Whether `block` lies in one of the runtime's placeholders by its record
 /// and is a reservation (no view, no allocation in its place).
 fn recorded_placeholder(block: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
     let at = block * BLOCK;
     let recorded = PLACEHOLDERS
         .read()
@@ -2132,6 +2134,8 @@ fn recorded_placeholder(block: usize) -> bool {
     recorded
         && unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } != 0
         && info.State == MEM_RESERVE
+        // (a view's uncommitted pages are reserved too, and are no hole)
+        && info.Type != MEM_MAPPED
 }
 
 /// The runtime reserved `[at, at + len)` as a placeholder (to be split and
