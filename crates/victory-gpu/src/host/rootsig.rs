@@ -508,6 +508,7 @@ mod tests {
         ("compose.rs", include_str!("../compose.rs")),
         ("host.rs", include_str!("../host.rs")),
         ("host/awake.rs", include_str!("awake.rs")),
+        ("host/rtbench.rs", include_str!("rtbench.rs")),
         ("host/send.rs", include_str!("send.rs")),
         ("host/upcheck.rs", include_str!("upcheck.rs")),
         ("indirect.rs", include_str!("../indirect.rs")),
