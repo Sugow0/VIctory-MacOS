@@ -7,14 +7,18 @@
 //! list and presents the target (`PresentX`). After N frames it returns.
 //!
 //! Arguments (after `--` on `victory run`): `[frames] [exit code] [clears]
-//! [copies]`, default 600 (10 s at 60 Hz: the frame meter logs every 5 s),
-//! 0, 0 and 0. `clears` adds that many more clears of the target to each
-//! frame's list; `copies` that many copies of the target into a second
-//! texture, each between two barriers (a load for measuring per-command
-//! cost: draws would need a console shader blob, which nothing here
-//! makes). A failed
-//! step returns 10 + the step instead (10-24; a null device is 24), so
-//! callers that pass an exit code keep below 10.
+//! [copies] [draws]`, default 600 (10 s at 60 Hz: the frame meter logs
+//! every 5 s), 0, 0, 0 and 0. `clears` adds that many more clears of the
+//! target to each frame's list; `copies` that many copies of the target
+//! into a second texture, each between two barriers; `draws` that many
+//! draws of a small triangle (loads for measuring per-command cost). The
+//! draws' shaders are console shader containers that build.rs makes
+//! (`victory_shader::native::synth`: GFX10 code, no game data): a vertex
+//! program placing the triangle from `SV_VertexID` (no vertex buffer) and
+//! a pixel program writing a constant colour; their pipeline comes from a
+//! stream, as titles make theirs. A failed step returns 10 + the step
+//! instead (10-26; a null device is 24), so callers that pass an exit code
+//! keep below 10.
 //!
 //! Calls go through the objects' tables by offset, as titles' code does:
 //! the offsets are the console's 2020-era layouts that victory-gpu
@@ -46,6 +50,10 @@ unsafe extern "C" {
     fn __p___argc() -> *mut i32;
     fn __p___argv() -> *mut *mut *mut c_char;
 }
+
+/// The draws' console shader containers (build.rs).
+static VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vs.dxbc"));
+static PIXEL_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/color.ps.dxbc"));
 
 #[repr(C)]
 struct VirtualMemory {
@@ -116,6 +124,53 @@ struct Plane {
     resources: *const This,
 }
 
+/// A viewport (`D3D12_VIEWPORT`).
+#[repr(C)]
+struct Viewport {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    min_depth: f32,
+    max_depth: f32,
+}
+
+/// A scissor rectangle (`RECT`).
+#[repr(C)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+/// A pipeline described as a stream (`D3D12_PIPELINE_STATE_STREAM_DESC`).
+#[repr(C)]
+struct StreamDesc {
+    size: usize,
+    stream: *const u8,
+}
+
+/// The draws' pipeline stream: subobjects of a u32 type, then their data
+/// (at +8 when it holds pointers), each padded to 8 bytes. The vertex and
+/// pixel shaders, then the state that is not D3D12's default for this
+/// triangle: no culling (it is counter-clockwise), no depth (there is no
+/// depth target), triangles, one RGBA8 target.
+#[repr(C, align(8))]
+struct Stream {
+    vs_kind: u64,
+    vs: [usize; 2],
+    ps_kind: u64,
+    ps: [usize; 2],
+    /// `D3D12_RASTERIZER_DESC` after its type.
+    rasterizer: [u32; 12],
+    /// `D3D12_DEPTH_STENCIL_DESC` after its type.
+    depth: [u32; 14],
+    topology: [u32; 2],
+    /// `D3D12_RT_FORMAT_ARRAY` after its type.
+    targets: [u32; 10],
+}
+
 const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> Iid {
     let (a, b, c) = (a.to_le_bytes(), b.to_le_bytes(), c.to_le_bytes());
     [
@@ -153,6 +208,18 @@ static IID_ALLOCATOR: Iid = guid(
     0x4b09,
     [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
 );
+static IID_ROOT_SIGNATURE: Iid = guid(
+    0xc54a6b66,
+    0x72df,
+    0x4ee8,
+    [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14],
+);
+static IID_PIPELINE: Iid = guid(
+    0x765a30f3,
+    0xf624,
+    0x4c6f,
+    [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+);
 static IID_LIST: Iid = guid(
     0x5b160d0f,
     0xac1b,
@@ -174,6 +241,18 @@ const COPY_SOURCE: u32 = 0x800;
 const ALL_SUBRESOURCES: u32 = 0xffff_ffff;
 const FRAME_ORIGIN: u32 = 0;
 const SIXTIETH_US: u32 = 16_667;
+const WIDTH: u32 = 1280;
+const HEIGHT: u32 = 720;
+const TRIANGLE_LIST: u32 = 4;
+const TOPOLOGY_TRIANGLES: u32 = 3;
+const FILL_SOLID: u32 = 3;
+const CULL_NONE: u32 = 1;
+const STENCIL_KEEP: u32 = 1;
+const ALWAYS: u32 = 8;
+/// A serialized root signature with no parameters (`RTS0` version 1.0,
+/// input assembler allowed). The host binds what the shaders read, which
+/// is nothing; titles pass theirs all the same.
+static ROOT_SIGNATURE: [u32; 6] = [1, 0, 24, 0, 24, 1];
 
 /// The method at `offset` in `object`'s table.
 ///
@@ -213,9 +292,10 @@ struct Arguments {
     code: u32,
     clears: u32,
     copies: u32,
+    draws: u32,
 }
 
-/// `[frames] [exit code] [clears] [copies]` from the title's arguments.
+/// `[frames] [exit code] [clears] [copies] [draws]` from the title's arguments.
 fn arguments() -> Arguments {
     // SAFETY: the runtime's argument accessors; `argv[argc]` is null.
     let (argc, argv) = unsafe { (*__p___argc(), *__p___argv()) };
@@ -230,6 +310,7 @@ fn arguments() -> Arguments {
         code: arg(2).unwrap_or(0),
         clears: arg(3).unwrap_or(0),
         copies: arg(4).unwrap_or(0),
+        draws: arg(5).unwrap_or(0),
     }
 }
 
@@ -293,8 +374,8 @@ fn run(args: &Arguments) -> Result<(), u32> {
         let desc = ResourceDesc {
             dimension: TEXTURE_2D,
             alignment: 0,
-            width: 1280,
-            height: 720,
+            width: WIDTH.into(),
+            height: HEIGHT,
             depth_or_array_size: 1,
             mip_levels: 1,
             format: RGBA8,
@@ -394,6 +475,53 @@ fn run(args: &Arguments) -> Result<(), u32> {
             7,
         )?;
 
+        // The draws' root signature and pipeline, only made when there are
+        // draws (a default run makes what it always made).
+        let mut root: This = null();
+        let mut pipeline: This = null();
+        if args.draws > 0 {
+            type CreateRoot =
+                extern "system" fn(This, u32, *const u8, usize, *const Iid, *mut This) -> Hr;
+            check(
+                method::<CreateRoot>(device, 0x80)(
+                    device,
+                    0,
+                    ROOT_SIGNATURE.as_ptr().cast(),
+                    size_of_val(&ROOT_SIGNATURE),
+                    &IID_ROOT_SIGNATURE,
+                    &mut root,
+                ),
+                15,
+            )?;
+            let keep = [STENCIL_KEEP, STENCIL_KEEP, STENCIL_KEEP, ALWAYS];
+            let stream = Stream {
+                vs_kind: 1,
+                vs: [VERTEX_SHADER.as_ptr() as usize, VERTEX_SHADER.len()],
+                ps_kind: 2,
+                ps: [PIXEL_SHADER.as_ptr() as usize, PIXEL_SHADER.len()],
+                // Solid, no culling, clockwise front, no bias, depth clip.
+                rasterizer: [10, FILL_SOLID, CULL_NONE, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+                // Depth off (func always, no writes), stencil off.
+                depth: [
+                    11, 0, 0, ALWAYS, 0, 0xffff, keep[0], keep[1], keep[2], keep[3], keep[0],
+                    keep[1], keep[2], keep[3],
+                ],
+                topology: [14, TOPOLOGY_TRIANGLES],
+                // One target, RGBA8.
+                targets: [15, RGBA8, 0, 0, 0, 0, 0, 0, 0, 1],
+            };
+            let desc = StreamDesc {
+                size: size_of::<Stream>(),
+                stream: (&raw const stream).cast(),
+            };
+            type CreateStream =
+                extern "system" fn(This, *const StreamDesc, *const Iid, *mut This) -> Hr;
+            check(
+                method::<CreateStream>(device, 0x2b0)(device, &desc, &IID_PIPELINE, &mut pipeline),
+                16,
+            )?;
+        }
+
         // Frame pacing as titles do it: an interval, then a wait for each
         // frame's start (`VICTORY_FRAME_INTERVAL_MS` replaces the interval).
         type SetInterval = extern "system" fn(This, This, u32, u32, u32) -> Hr;
@@ -414,6 +542,28 @@ fn run(args: &Arguments) -> Result<(), u32> {
         let execute = method::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
         type Present = extern "system" fn(This, u32, *const Plane, *const u8) -> Hr;
         let present = method::<Present>(queue, 0xf0);
+        let draw = method::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60);
+        let topology = method::<extern "system" fn(This, u32)>(list, 0xa0);
+        let viewports = method::<extern "system" fn(This, u32, *const Viewport)>(list, 0xa8);
+        let scissors = method::<extern "system" fn(This, u32, *const Rect)>(list, 0xb0);
+        let set_pipeline = method::<extern "system" fn(This, This)>(list, 0xc8);
+        let set_root = method::<extern "system" fn(This, This)>(list, 0x110);
+        let set_targets =
+            method::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190);
+        let viewport = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: WIDTH as f32,
+            height: HEIGHT as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = Rect {
+            left: 0,
+            top: 0,
+            right: WIDTH as i32,
+            bottom: HEIGHT as i32,
+        };
 
         for frame in 0..args.frames {
             let mut token = 0u64;
@@ -435,6 +585,17 @@ fn run(args: &Arguments) -> Result<(), u32> {
                 before,
                 after,
             };
+            if args.draws > 0 {
+                set_root(list, root);
+                set_pipeline(list, pipeline);
+                topology(list, TRIANGLE_LIST);
+                viewports(list, 1, &viewport);
+                scissors(list, 1, &scissor);
+                set_targets(list, 1, &rtv, 0, null());
+                for _ in 0..args.draws {
+                    draw(list, 3, 1, 0, 0);
+                }
+            }
             for _ in 0..args.copies {
                 barrier(list, 1, &transition(RENDER_TARGET, COPY_SOURCE));
                 copy_resource(list, copy, target);

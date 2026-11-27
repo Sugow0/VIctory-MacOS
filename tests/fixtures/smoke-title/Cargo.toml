@@ -18,6 +18,10 @@ path = "src/main.rs"
 test = false
 bench = false
 
+# The draws' shader containers are made at build time (build.rs).
+[build-dependencies]
+victory-shader = { path = "../../../crates/victory-shader", features = ["synth"] }
+
 [profile.dev]
 panic = "abort"
 

@@ -2,7 +2,8 @@
 //! (tests/fixtures/smoke-title), through the loader, HLE and the GPU layer
 //! to the host's swap chain, without any game data. The title clears and
 //! presents frames, then returns; the run must say it exited with 0 and
-//! the frame meter must have logged frame times.
+//! the frame meter must have logged frame times. With draws asked for, the
+//! meter must also show them run on the host.
 //!
 //! Where it cannot run (no host D3D12 device or no swap chain, as on a
 //! machine without a GPU) the end-to-end tests say so and pass; anything
@@ -51,6 +52,42 @@ fn verdict(exited_ok: bool, output: &str) -> Verdict {
         ));
     }
     Verdict::Passed(times)
+}
+
+/// [`verdict`], for a run whose title draws: every frame meter line must
+/// count draws run on the host (`"..., 100 draws/frame, dropped ..."`).
+fn drawing_verdict(exited_ok: bool, output: &str) -> Verdict {
+    let judged = verdict(exited_ok, output);
+    if !matches!(judged, Verdict::Passed(_)) {
+        return judged;
+    }
+    let output = strip_ansi(output);
+    let draws = draws_per_frame(&output);
+    if draws.is_empty() {
+        return Verdict::Failed(format!(
+            "no \"draws/frame\" in the frame meter's lines\n{}",
+            tail(&output)
+        ));
+    }
+    if draws.contains(&0.0) {
+        return Verdict::Failed(format!(
+            "a meter line with 0 draws/frame ({draws:?}): the draws did not reach the host\n{}",
+            tail(&output)
+        ));
+    }
+    judged
+}
+
+/// The draws run on the host per frame of each frame meter line.
+fn draws_per_frame(output: &str) -> Vec<f64> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let (before, _) = l.split_once(" draws/frame, dropped ")?;
+            let (_, n) = before.rsplit_once(' ')?;
+            n.parse().ok()
+        })
+        .collect()
 }
 
 /// The ms/frame of each frame meter line (`"60.0 fps, 16.7 ms/frame (..."`).
@@ -107,6 +144,36 @@ fn a_clean_run_passes_with_its_frame_times() {
     assert_eq!(verdict(true, out), Verdict::Passed(vec![16.7, 16.8]));
     assert_eq!(median(&[16.8, 8.3, 16.7]), 16.7);
     assert_eq!(median(&[1.0, 3.0]), 2.0);
+}
+
+#[test]
+fn draws_must_reach_the_host() {
+    let line = |draws| {
+        format!(
+            "INFO 60.0 fps, 16.7 ms/frame (0.3 preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms \
+             0.0 MB; 15.1 on the GPU; 0.0 copying back 0.0 MB), {draws} draws/frame, dropped 0 \
+             without a host pipeline (0 being made) and 0 indirect; ...\n"
+        )
+    };
+    let out = line(1000) + &line(999) + "title exited with 0\n";
+    assert_eq!(
+        drawing_verdict(true, &out),
+        Verdict::Passed(vec![16.7, 16.7])
+    );
+    // Without draws asked for, none are wanted.
+    let out = line(0) + "title exited with 0\n";
+    assert_eq!(verdict(true, &out), Verdict::Passed(vec![16.7]));
+    // A line without draws on the host fails a drawing run, as does a meter
+    // that does not count them.
+    let out = line(1000) + &line(0) + "title exited with 0\n";
+    assert!(matches!(drawing_verdict(true, &out), Verdict::Failed(why) if why.contains("draws")));
+    let out = "INFO 60.0 fps, 16.7 ms/frame (x)\ntitle exited with 0\n";
+    assert!(matches!(drawing_verdict(true, out), Verdict::Failed(why) if why.contains("draws")));
+    // Other failures stay what they are.
+    let out = line(1000) + "title exited with 25\n";
+    assert!(
+        matches!(drawing_verdict(true, &out), Verdict::Failed(why) if why.starts_with("title exited with 25"))
+    );
 }
 
 #[test]
@@ -219,28 +286,36 @@ mod end_to_end {
         (status.success(), output)
     }
 
-    /// 900 frames at the title's 60 Hz: 15 s, well past the meter's first
-    /// line (it logs frame times every 5 s from the swap chain's making);
-    /// then the same title failing (exit code 3), which must be caught.
-    /// One test, so that the two runs (two windows) do not overlap.
-    /// `VICTORY_SMOKE_REQUIRE=1` makes a skip a failure.
-    #[test]
-    fn a_synthetic_title_presents_frames_and_exits_0() {
-        let (ok, output) = run(&["900"]);
-        match verdict(ok, &output) {
+    /// Passes on a pass or a skip (`VICTORY_SMOKE_REQUIRE=1` makes a skip
+    /// a failure); `what` names the run.
+    fn expect_pass(what: &str, judged: Verdict) {
+        match judged {
             Verdict::Passed(times) => {
                 println!(
-                    "smoke: {} meter lines, median {:.1} ms/frame",
+                    "smoke ({what}): {} meter lines, median {:.1} ms/frame",
                     times.len(),
                     median(&times)
                 );
             }
             Verdict::Skipped(why) if std::env::var_os("VICTORY_SMOKE_REQUIRE").is_none() => {
-                println!("smoke test skipped: {why}");
+                println!("smoke test ({what}) skipped: {why}");
             }
             Verdict::Skipped(why) => panic!("skipped, with VICTORY_SMOKE_REQUIRE set: {why}"),
-            Verdict::Failed(why) => panic!("{why}"),
+            Verdict::Failed(why) => panic!("{what}: {why}"),
         }
+    }
+
+    /// 900 frames at the title's 60 Hz: 15 s, well past the meter's first
+    /// line (it logs frame times every 5 s from the swap chain's making);
+    /// the same with 100 draws a frame, which must reach the host; then
+    /// the title failing (exit code 3), which must be caught. One test, so
+    /// that the runs (their windows) do not overlap.
+    #[test]
+    fn a_synthetic_title_presents_frames_and_exits_0() {
+        let (ok, output) = run(&["900"]);
+        expect_pass("plain", verdict(ok, &output));
+        let (ok, output) = run(&["900", "0", "0", "0", "100"]);
+        expect_pass("100 draws a frame", drawing_verdict(ok, &output));
         let (ok, output) = run(&["30", "3"]);
         let failing = verdict(ok, &output);
         assert!(
