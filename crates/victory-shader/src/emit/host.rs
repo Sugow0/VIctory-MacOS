@@ -67,6 +67,59 @@ fn software(desc: &DXGI_ADAPTER_DESC1) -> bool {
         || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
 }
 
+/// The adapter name D3DMetal (Apple's D3D12 on Metal, under Wine) gives
+/// every GPU it shows.
+const D3DMETAL_ADAPTER: &str = "AMD Compatibility Mode";
+
+/// Whether D3D12 here is D3DMetal: under Wine (ntdll exports
+/// `wine_get_version`) with an adapter named as D3DMetal names them.
+///
+/// For tests that check what the D3D12 runtime or driver does and D3DMetal
+/// does otherwise while reporting the capability (docs/macos.md, known
+/// limits). Behaviour a capability query decides is chosen by that query.
+pub fn on_d3dmetal() -> bool {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        // SAFETY: plain lookups in ntdll, always loaded, and adapter queries.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            let wine = !ntdll.is_null()
+                && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some();
+            if !wine {
+                return false;
+            }
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return false;
+            };
+            (0..)
+                .map_while(|i| factory.EnumAdapters1(i).ok())
+                .filter_map(|a| a.GetDesc1().ok())
+                .any(|d| {
+                    String::from_utf16_lossy(&d.Description).trim_end_matches('\0')
+                        == D3DMETAL_ADAPTER
+                })
+        }
+    })
+}
+
+/// The device's `WaveLaneCountMin..=WaveLaneCountMax`, if it answers.
+pub fn wave_lanes(device: &ID3D12Device) -> Option<std::ops::RangeInclusive<u32>> {
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a feature structure of the requested type and size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    }
+    .ok()?;
+    Some(waves.WaveLaneCountMin..=waves.WaveLaneCountMax)
+}
+
 fn adapter_matches(requested: &str, index: u32, name: &str) -> bool {
     if let Ok(wanted) = requested.parse::<u32>() {
         wanted == index
@@ -374,6 +427,17 @@ impl Host {
         root: &ID3D12RootSignature,
         cs: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        // A wave size the device does not run is refused here, as a driver
+        // refuses it (NVIDIA's); D3DMetal takes it and runs the program wrong.
+        if let (Some(n), Some(lanes)) = (super::wanted_wave(cs), wave_lanes(&self.device))
+            && !lanes.contains(&n)
+        {
+            return Err(format!(
+                "WaveSize({n}) outside the device's waves of {} to {} lanes",
+                lanes.start(),
+                lanes.end()
+            ));
+        }
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the descriptor never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(root) },

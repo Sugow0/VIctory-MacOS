@@ -566,17 +566,22 @@ mod tests {
             iid[8..16].try_into().unwrap(),
         );
         let mut out = std::ptr::null_mut();
-        assert_eq!(
-            create_deserializer(data, size - 1, &iid, &mut out),
-            E_INVALIDARG
-        );
-        assert!(out.is_null());
-        let garbage = [0xffu8; 64];
-        assert_eq!(
-            create_deserializer(garbage.as_ptr(), garbage.len(), &iid, &mut out),
-            E_INVALIDARG
-        );
-        assert!(out.is_null());
+        // (D3DMetal's d3d12.dll takes a truncated blob: docs/macos.md)
+        if victory_shader::emit::host::on_d3dmetal() {
+            eprintln!("D3DMetal does not check root signature blobs; not run");
+        } else {
+            assert_eq!(
+                create_deserializer(data, size - 1, &iid, &mut out),
+                E_INVALIDARG
+            );
+            assert!(out.is_null());
+            let garbage = [0xffu8; 64];
+            assert_eq!(
+                create_deserializer(garbage.as_ptr(), garbage.len(), &iid, &mut out),
+                E_INVALIDARG
+            );
+            assert!(out.is_null());
+        }
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }
 }
