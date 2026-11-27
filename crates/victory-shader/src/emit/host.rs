@@ -74,9 +74,11 @@ const D3DMETAL_ADAPTER: &str = "AMD Compatibility Mode";
 /// Whether D3D12 here is D3DMetal: under Wine (ntdll exports
 /// `wine_get_version`) with an adapter named as D3DMetal names them.
 ///
-/// For tests that check what the D3D12 runtime or driver does and D3DMetal
-/// does otherwise while reporting the capability (docs/macos.md, known
-/// limits). Behaviour a capability query decides is chosen by that query.
+/// For what D3DMetal does otherwise while reporting the capability
+/// (docs/macos.md, known limits): tests that check what the D3D12 runtime
+/// or driver does, and the translation, through the runtime's
+/// `set_host_derived_vertices` (its `attributeAtVertex` gives 0).
+/// Behaviour a capability query decides is chosen by that query.
 pub fn on_d3dmetal() -> bool {
     use std::sync::OnceLock;
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
@@ -556,7 +558,7 @@ impl Host {
                 pInputElementDescs: layout.as_ptr(),
                 NumElements: layout.len() as u32,
             },
-            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            PrimitiveTopologyType: topology().0,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -806,6 +808,23 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's primitives for its pipelines and draws (none: triangles).
+    pub static TEST_TOPOLOGY: std::cell::Cell<Option<(D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D_PRIMITIVE_TOPOLOGY)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The primitives graphics pipelines and draws take: a triangle list, or
+/// what a test chose ([`TEST_TOPOLOGY`]).
+fn topology() -> (D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D_PRIMITIVE_TOPOLOGY) {
+    #[cfg(test)]
+    if let Some(t) = TEST_TOPOLOGY.get() {
+        return t;
+    }
+    (D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -1058,7 +1077,7 @@ impl Host {
                 bottom: h as i32,
                 ..Default::default()
             }]);
-            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.IASetPrimitiveTopology(topology().1);
             if let Some(vb) = &vb {
                 list.IASetVertexBuffers(
                     0,

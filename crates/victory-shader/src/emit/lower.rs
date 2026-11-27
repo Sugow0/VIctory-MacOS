@@ -11354,7 +11354,9 @@ impl<'a> Lower<'a> {
         let derive = matches!(eval, Eval::Weights { .. }) && self.derives_vertices(id);
         let mode = match eval {
             Eval::Mode(mode) => mode,
-            Eval::Weights { .. } if derive => 2,
+            Eval::Weights { .. } if derive => {
+                self.derive_kind().and_then(interp_mode).ok_or("an interpolation")?
+            }
             Eval::Weights { .. } => 1,
         };
         let e = &mut self.s.inputs[id];
@@ -11405,8 +11407,8 @@ impl<'a> Lower<'a> {
     /// interpolated value (`Lower::derived_vertices`): on a host whose
     /// `attributeAtVertex` is wrong ([`set_host_derived_vertices`]), for a
     /// 32-bit float element (the others cannot be interpolated) of a row
-    /// the console does not hold as 16-bit values, when perspective
-    /// barycentrics can be declared beside the program's.
+    /// the console does not hold as 16-bit values, when the program's
+    /// barycentrics leave a kind to weigh it with ([`Lower::derive_kind`]).
     fn derives_vertices(&mut self, id: usize) -> bool {
         let e = &self.s.inputs[id];
         if !host_derived_vertices() || e.comp != 9 || e.half || e.kind != 0 {
@@ -11421,20 +11423,61 @@ impl<'a> Lower<'a> {
         if fp16 {
             return false;
         }
-        matches!(self.barycentric(Barycentric::PerspectiveCenter, 0), Val::I32(_))
+        let Some(kind) = self.derive_kind() else {
+            return false;
+        };
+        matches!(self.barycentric(kind, 0), Val::I32(_))
+    }
+
+    /// The barycentrics derived vertices are weighed with, and their
+    /// element interpolated as: a kind the program declares
+    /// `SV_Barycentrics` for anyway (values it reads, interpolations of rows
+    /// it reads per vertex), the first in DXIL's order, so that no third is
+    /// needed; perspective center when it has none. None when it has more
+    /// than two.
+    fn derive_kind(&self) -> Option<Barycentric> {
+        let values = self.x.io.inputs.iter().filter_map(|(_, i)| match *i {
+            Input::Barycentric { kind, .. } => Some(kind),
+            _ => None,
+        });
+        let interpolations = self.x.io.interps.iter().filter_map(|(_, i)| match *i {
+            Interp::Interpolated {
+                attribute,
+                barycentric,
+                ..
+            } if self.per_vertex(attribute.row) => Some(barycentric),
+            _ => None,
+        });
+        let mut kinds: Vec<(u8, Barycentric)> = values
+            .chain(interpolations)
+            .filter_map(|k| interp_mode(k).map(|m| (m, k)))
+            .collect();
+        kinds.sort_by_key(|&(m, _)| m);
+        kinds.dedup_by_key(|&mut (m, _)| m);
+        match kinds.len() {
+            0 => Some(Barycentric::PerspectiveCenter),
+            1 | 2 => Some(kinds[0].1),
+            _ => None,
+        }
     }
 
     /// The three vertices of channel `col` of input element `id` (declared
-    /// perspective-interpolated) as floats, 0 the provoking vertex, without
-    /// `attributeAtVertex`: the value is A = P0 + i (P1 - P0) + j (P2 - P0)
-    /// with i and j the perspective `SV_Barycentrics` weights of vertices 1
-    /// and 2, so across the quad dA = d1 di + d2 dj for d1 = P1 - P0 and
-    /// d2 = P2 - P0. The fine derivatives of A, i and j in x and y give d1
-    /// and d2 (Cramer's rule), then P0 = A - i d1 - j d2. Read in the entry
-    /// block, where every lane of the quad runs.
-    /// shortcut: exact in real numbers; in floats d1 and d2 lose about as
-    /// many bits as the triangle is pixels across (a 1000-pixel triangle:
-    /// some 1e-4 of the attribute's size).
+    /// interpolated as [`Lower::derive_kind`]) as floats, 0 the provoking
+    /// vertex, without `attributeAtVertex`: the value is
+    /// A = P0 + i (P1 - P0) + j (P2 - P0) with i and j the `SV_Barycentrics`
+    /// weights of vertices 1 and 2 of that kind, so across the quad
+    /// dA = d1 di + d2 dj for d1 = P1 - P0 and d2 = P2 - P0. The fine
+    /// derivatives of A, i and j in x and y give d1 and d2 (Cramer's rule),
+    /// then P0 = A - i d1 - j d2. Read in the entry block, where every lane
+    /// of the quad runs.
+    /// shortcut: exact in real numbers. In floats dA is A's change across a
+    /// pixel rounded to A's precision, so d1, d2 and P0 are off by about an
+    /// ulp of |A| times the triangle's size in pixels: little relative to
+    /// the vertices' differences when A changes by many ulps per pixel
+    /// (some 1e-5 on the tests' 8x8 triangle), gross for a large value
+    /// changing little per pixel (1e5, an ulp of 0.008, over 100 pixels:
+    /// off by about 1, so no exact ids). P0 cannot be read flat beside it:
+    /// one element has one interpolation mode.
     fn derived_vertices(&mut self, id: usize, col: u8) -> Result<[V; 3], Why> {
         if let Some(&v) = self.derived.get(&(id, col)) {
             return Ok(v);
@@ -11446,11 +11489,12 @@ impl<'a> Lower<'a> {
             Val::Missing(w) => Err(w),
             Val::Bit(_) => Err("an input"),
         };
+        let kind = self.derive_kind().ok_or("barycentrics of a third interpolation mode")?;
         let a = self.load_any_input(id, col);
         let a = float(self, a)?;
-        let i = self.barycentric(Barycentric::PerspectiveCenter, 0);
+        let i = self.barycentric(kind, 0);
         let i = float(self, i)?;
-        let j = self.barycentric(Barycentric::PerspectiveCenter, 1);
+        let j = self.barycentric(kind, 1);
         let j = float(self, j)?;
         // DerivFineX (85) and DerivFineY (86).
         let d = |l: &mut Self, op: u32, x: V| {
@@ -11460,17 +11504,29 @@ impl<'a> Lower<'a> {
         let (ix, iy) = (d(self, 85, i), d(self, 86, i));
         let (jx, jy) = (d(self, 85, j), d(self, 86, j));
         let m = &mut self.s.m;
-        // a b - c e
-        let mut cross = |a: V, b: V, c: V, e: V| {
+        // a b - c e, or a b + c e
+        let two = |m: &mut super::bitcode::Module, op: Bin, a: V, b: V, c: V, e: V| {
             let ab = m.bin(entry, Bin::Mul, a, b);
             let ce = m.bin(entry, Bin::Mul, c, e);
-            m.bin(entry, Bin::Sub, ab, ce)
+            m.bin(entry, op, ab, ce)
         };
-        let det = cross(ix, jy, jx, iy);
-        let n1 = cross(ax, jy, ay, jx);
-        let n2 = cross(ix, ay, iy, ax);
+        let det = two(m, Bin::Sub, ix, jy, jx, iy);
+        let n1 = two(m, Bin::Sub, ax, jy, ay, jx);
+        let n2 = two(m, Bin::Sub, ix, ay, iy, ax);
         let d1 = m.bin(entry, Bin::SDiv, n1, det);
         let d2 = m.bin(entry, Bin::SDiv, n2, det);
+        // A line (j is 0) or a point (i too) has no 2x2 system: on a line
+        // dA = d1 di, so d1 = (dA . di) / (di . di); on a point both are 0
+        // and P0 is A.
+        let zero = m.f32(0);
+        let flat = m.cmp(entry, pred::OEQ, det, zero);
+        let ii = two(m, Bin::Add, ix, ix, iy, iy);
+        let ai = two(m, Bin::Add, ax, ix, ay, iy);
+        let line = m.bin(entry, Bin::SDiv, ai, ii);
+        let point = m.cmp(entry, pred::OEQ, ii, zero);
+        let line = m.select(entry, point, zero, line);
+        let d1 = m.select(entry, flat, line, d1);
+        let d2 = m.select(entry, flat, zero, d2);
         let id1 = m.bin(entry, Bin::Mul, i, d1);
         let jd2 = m.bin(entry, Bin::Mul, j, d2);
         let p0 = m.bin(entry, Bin::Sub, a, id1);
