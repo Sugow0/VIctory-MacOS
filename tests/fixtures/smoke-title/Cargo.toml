@@ -1,0 +1,27 @@
+# A synthetic title for the end-to-end smoke test (apps/victory/tests/
+# smoke_title.rs, scripts/smoke-macos.sh): an EXE that makes the console's
+# D3D12 device, clears a render target and presents it N times, then
+# returns 0. No game data. It imports from console DLLs (raw-dylib), so it
+# only runs through `victory run --execute`.
+# It is NOT a workspace member: it is built on demand into its own target
+# directory, for x86_64-pc-windows-msvc only.
+[package]
+name = "smoke-title"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "smoke-title"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]
