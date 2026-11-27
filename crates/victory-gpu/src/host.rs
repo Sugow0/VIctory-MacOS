@@ -1054,6 +1054,13 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // D3DMetal reports barycentrics but its attributeAtVertex gives 0 (its SV_Barycentrics
+        // is right): attributes read per vertex get their vertices derived (docs/macos.md)
+        let d3dmetal = victory_shader::emit::host::on_d3dmetal();
+        if d3dmetal {
+            tracing::info!("D3DMetal: pixel attributes read per vertex are derived from interpolated values");
+        }
+        victory_shader::emit::set_host_derived_vertices(d3dmetal);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

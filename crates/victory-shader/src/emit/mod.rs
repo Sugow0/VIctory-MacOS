@@ -118,7 +118,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{
+    host_settings, set_host_derived_vertices, set_host_max_wave, set_host_rdna, set_thread_max_wave,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -295,6 +297,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
+    out.push(u8::from(lower::host_derived_vertices()));
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
@@ -3018,17 +3021,13 @@ mod barycentric_tests {
         pixel(&words, PERSP_CENTER).unwrap()
     }
 
-    #[test]
+    /// A vertex shader passing POSITION and TEXCOORD through, with TEXCOORD
+    /// in the same output row as the translated pixel shader's input
+    /// signature.
     #[cfg(windows)]
-    fn first_half_values_render_on_hardware_and_warp() {
+    fn pass_through_vs() -> HostShader {
         use super::bitcode::{Attr, Term};
-        use super::host::{Draw, Host};
         use super::shader::Shader;
-        let _one = super::valu_tests::ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Pass POSITION and TEXCOORD through, with TEXCOORD in the same
-        // output row as the translated pixel shader's input signature.
         let mut s = Shader::new(false);
         s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
         for e in &mut s.inputs {
@@ -3055,7 +3054,7 @@ mod barycentric_tests {
             }
         }
         s.m.terminate(s.entry, Term::Ret);
-        let vs = HostShader {
+        HostShader {
             stage: HwStage::Vs,
             dxil: s.finish(),
             user_data: Vec::new(),
@@ -3065,7 +3064,35 @@ mod barycentric_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
-        };
+        }
+    }
+
+    /// Whether the host reports `SV_Barycentrics` (`OPTIONS3`).
+    #[cfg(windows)]
+    fn has_barycentrics(host: &super::host::Host) -> bool {
+        let mut options =
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // SAFETY: a correctly sized output for the feature query.
+        unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .unwrap();
+        }
+        options.BarycentricsSupported.as_bool()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn first_half_values_render_on_hardware_and_warp() {
+        use super::host::{Draw, Host};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vs = pass_through_vs();
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
         let vertices = [
@@ -3075,30 +3102,20 @@ mod barycentric_tests {
         let mut ran = 0;
         for (backend, warp) in [("hardware", false), ("WARP", true)] {
             let Ok(host) = Host::new(warp) else { continue };
-            let mut options =
-                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
-            // SAFETY: a correctly sized output for the feature query.
-            unsafe {
-                host.device
-                    .CheckFeatureSupport(
-                        windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS3,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .unwrap();
-            }
-            if !options.BarycentricsSupported.as_bool() {
+            if !has_barycentrics(&host) {
                 eprintln!("no barycentrics on {backend}; skipped");
                 continue;
             }
-            if !warp && super::host::on_d3dmetal() {
-                // (it reports barycentrics, and SV_Barycentrics with an
-                // attribute per vertex gives 0: docs/macos.md)
-                eprintln!("D3DMetal's barycentric interpolation gives 0 on {backend}; skipped");
-                continue;
-            }
-            for paired in [false, true] {
+            // D3DMetal's attributeAtVertex gives 0 (docs/macos.md): there
+            // only with the vertices derived, elsewhere both ways.
+            let d3dmetal = !warp && super::host::on_d3dmetal();
+            for (paired, derived) in [(false, false), (true, false), (false, true), (true, true)] {
+                if d3dmetal && !derived {
+                    continue;
+                }
+                super::lower::TEST_DERIVED_VERTICES.set(Some(derived));
                 let ps = first_half_pixel(paired);
+                super::lower::TEST_DERIVED_VERTICES.set(None);
                 validate(&ps);
                 let (root, pso) = host.pipeline(&vs, &ps).expect("interpolation pipeline");
                 let out = host
@@ -3128,7 +3145,7 @@ mod barycentric_tests {
                     for &got in texel {
                         assert!(
                             (got - want).abs() < 1e-5,
-                            "{backend} paired={paired} pixel={n}: got {got}, want {want}"
+                            "{backend} paired={paired} derived={derived} pixel={n}: got {got}, want {want}"
                         );
                     }
                 }
@@ -3138,6 +3155,278 @@ mod barycentric_tests {
         }
         if ran == 0 {
             eprintln!("no SM 6.6 host with barycentrics; GPU checks skipped");
+        }
+    }
+
+    /// Vertex values read with constant weights (P0, P1, P2 and their mean)
+    /// and P0 read flat beside them, one vertex at w = 3: from
+    /// `attributeAtVertex`, and from the interpolated value when the host's
+    /// is wrong (`set_host_derived_vertices`; D3DMetal's gives 0).
+    #[test]
+    #[cfg(windows)]
+    fn vertex_values_render_derived_or_read() {
+        use super::host::{Draw, Host};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vs = pass_through_vs();
+        // One triangle covers an 8x8 target, with attribute values 2, 6, 10;
+        // the second vertex has w = 3 (its position scaled to match).
+        let mut vertices = [
+            -1.0, 1.0, 0.5, 1.0, 2.0, 0.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 6.0, 0.0, 0.0, 0.0, 3.0,
+            1.0, 0.5, 1.0, 10.0, 0.0, 0.0, 0.0,
+        ];
+        for x in &mut vertices[8..12] {
+            *x *= 3.0;
+        }
+        let [e0, e1] = exp_mrt0(2);
+        // v_mov_b32 v3, i; v_mov_b32 v4, j; v_interp_p1_f32 v2, v3, attr0.x;
+        // v_interp_p2_f32 v2, v4, attr0.x.
+        let weighed = |i: u32, j: u32| {
+            vec![0x7E06_0200 | i, 0x7E08_0200 | j, 0xC808_0003, 0xC809_0004]
+        };
+        let mut both = weighed(0xF0, 0xF0);
+        // v_interp_mov_f32 v5, p0, attr0.x; v_add_f32 v2, v2, v5.
+        both.extend([0xC816_0002, v_add_f32(2, 2, 5)]);
+        let cases = [
+            (weighed(0x80, 0x80), 2.0),
+            (weighed(0xF2, 0x80), 6.0),
+            (weighed(0x80, 0xF2), 10.0),
+            (both, 8.0 + 2.0),
+        ];
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            if !has_barycentrics(&host) {
+                eprintln!("no barycentrics on {backend}; skipped");
+                continue;
+            }
+            let d3dmetal = !warp && super::host::on_d3dmetal();
+            for derived in [false, true] {
+                if d3dmetal && !derived {
+                    continue;
+                }
+                for (body, want) in &cases {
+                    let mut words = body.clone();
+                    words.extend([e0, e1, S_ENDPGM]);
+                    super::lower::TEST_DERIVED_VERTICES.set(Some(derived));
+                    let ps = pixel(&words, PERSP_CENTER).unwrap();
+                    super::lower::TEST_DERIVED_VERTICES.set(None);
+                    validate(&ps);
+                    // Derived vertices interpolate the element, read ones keep it constant.
+                    assert_eq!(texcoord_mode(&ps), if derived { 2 } else { 1 });
+                    let (root, pso) = host.pipeline(&vs, &ps).expect("vertex value pipeline");
+                    let out = host
+                        .draw(
+                            &root,
+                            &pso,
+                            &Draw {
+                                roots: Vec::new(),
+                                textures: &[],
+                                samplers: &[],
+                                vertices: &vertices,
+                                stride: 32,
+                                size: (8, 8),
+                                mesh_groups: 0,
+                            },
+                        )
+                        .expect("draw vertex values");
+                    for (n, texel) in out.iter().enumerate() {
+                        let got = texel[0];
+                        assert!(
+                            (got - want).abs() < 1e-4,
+                            "{backend} derived={derived} words={body:x?} pixel={n}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+            ran += 1;
+            eprintln!("vertex values render correctly on {backend}");
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 host with barycentrics; GPU checks skipped");
+        }
+    }
+
+    /// Vertex values on lines and points, where the barycentrics leave no
+    /// 2x2 system (j is 0 on a line, i too on a point): P0 and P1 of a
+    /// line, P0 of a point, read or derived.
+    #[test]
+    #[cfg(windows)]
+    fn vertex_values_on_lines_and_points() {
+        use super::host::{Draw, Host, TEST_TOPOLOGY};
+        use windows::Win32::Graphics::Direct3D::*;
+        use windows::Win32::Graphics::Direct3D12::*;
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vs = pass_through_vs();
+        // A vertex at pixel (column, row) of the 8x8 target, with value v.
+        let at = |col: f32, row: f32, v: f32| {
+            let x = (col + 0.5) / 4.0 - 1.0;
+            let y = 1.0 - (row + 0.5) / 4.0;
+            [x, y, 0.5, 1.0, v, 0.0, 0.0, 0.0]
+        };
+        let [e0, e1] = exp_mrt0(2);
+        let weighed = |i: u32, j: u32| {
+            vec![0x7E06_0200 | i, 0x7E08_0200 | j, 0xC808_0003, 0xC809_0004]
+        };
+        let mut with_p0 = weighed(0x80, 0x80);
+        // v_interp_mov_f32 v5, p0, attr0.x; v_add_f32 v2, v2, v5.
+        with_p0.extend([0xC816_0002, v_add_f32(2, 2, 5)]);
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            if !has_barycentrics(&host) {
+                eprintln!("no barycentrics on {backend}; skipped");
+                continue;
+            }
+            let d3dmetal = !warp && super::host::on_d3dmetal();
+            // A line across row 2 from 2 to 6, and three points.
+            let line: Vec<f32> = [at(0.0, 2.0, 2.0), at(8.0, 2.0, 6.0), at(0.0, 0.0, 0.0)].concat();
+            let points: Vec<f32> = [at(1.0, 1.0, 2.0), at(4.0, 2.0, 6.0), at(6.0, 6.0, 10.0)].concat();
+            let lines = (D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+            let dots = (D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT, D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+            // The points' pixels' values.
+            fn point(n: usize) -> f32 {
+                match n {
+                    9 => 2.0,
+                    20 => 6.0,
+                    54 => 10.0,
+                    _ => f32::NAN,
+                }
+            }
+            // (topology, vertices, words, value at a covered pixel n, pixels at least)
+            type Want = fn(usize) -> f32;
+            let cases: [(_, &[f32], Vec<u32>, Want, usize); 5] = [
+                (lines, &line, weighed(0x80, 0x80), |_| 2.0, 6),
+                (lines, &line, weighed(0xF2, 0x80), |_| 6.0, 6),
+                (lines, &line, with_p0.clone(), |_| 4.0, 6),
+                (dots, &points, weighed(0x80, 0x80), point, 3),
+                (dots, &points, with_p0.clone(), |n| 2.0 * point(n), 3),
+            ];
+            for derived in [false, true] {
+                if d3dmetal && !derived {
+                    continue;
+                }
+                for (topology, vertices, body, want, least) in &cases {
+                    let mut words = body.clone();
+                    words.extend([e0, e1, S_ENDPGM]);
+                    super::lower::TEST_DERIVED_VERTICES.set(Some(derived));
+                    let ps = pixel(&words, PERSP_CENTER).unwrap();
+                    super::lower::TEST_DERIVED_VERTICES.set(None);
+                    validate(&ps);
+                    TEST_TOPOLOGY.set(Some(*topology));
+                    let drawn = host.pipeline(&vs, &ps).and_then(|(root, pso)| {
+                        host.draw(
+                            &root,
+                            &pso,
+                            &Draw {
+                                roots: Vec::new(),
+                                textures: &[],
+                                samplers: &[],
+                                vertices,
+                                stride: 32,
+                                size: (8, 8),
+                                mesh_groups: 0,
+                            },
+                        )
+                    });
+                    TEST_TOPOLOGY.set(None);
+                    let out = drawn.expect("draw lines or points");
+                    let covered: Vec<(usize, f32)> = out
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| t[0] != 0.0)
+                        .map(|(n, t)| (n, t[0]))
+                        .collect();
+                    assert!(
+                        covered.len() >= *least,
+                        "{backend} derived={derived} words={body:x?}: {covered:?}"
+                    );
+                    if *least == 3 {
+                        assert_eq!(covered.iter().map(|c| c.0).collect::<Vec<_>>(), [9, 20, 54]);
+                    }
+                    for &(n, got) in &covered {
+                        let want = want(n);
+                        assert!(
+                            (got - want).abs() < 1e-4,
+                            "{backend} derived={derived} words={body:x?} pixel={n}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+            ran += 1;
+            eprintln!("vertex values on lines and points render correctly on {backend}");
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 host with barycentrics; GPU checks skipped");
+        }
+    }
+
+    /// With the host's vertex reads derived, a program reading vertices
+    /// declares TEXCOORD0 perspective-interpolated beside `SV_Barycentrics`.
+    #[test]
+    fn derived_vertices_interpolate_the_element() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0x1006_00F0, // v_mul_f32 v3, 0.5, v0
+            0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xC816_0002, // v_interp_mov_f32 v5, p0, attr0.x
+            v_add_f32(2, 2, 5),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        assert_eq!(texcoord_mode(&pixel(&words, PERSP_CENTER).unwrap()), 1);
+        super::lower::TEST_DERIVED_VERTICES.set(Some(true));
+        let shader = pixel(&words, PERSP_CENTER);
+        super::lower::TEST_DERIVED_VERTICES.set(None);
+        let shader = shader.unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 2);
+        validate(&shader);
+    }
+
+    /// With the vertices derived, a program that already reads two kinds
+    /// of barycentrics (perspective centroid and linear center, as values)
+    /// gets no third: the element is interpolated as one of them, the
+    /// center one.
+    #[test]
+    fn derived_vertices_take_a_mode_the_program_has() {
+        const PERSP_CENTROID: u32 = 1 << 2;
+        let [e0, e1] = exp_mrt0(7);
+        let values = v_add_f32(6, 0, 2); // v6 = perspective centroid i + linear center i
+        let vertices = [
+            0x7E08_02F0, // v_mov_b32 v4, 0.5
+            0xC81C_0004, // v_interp_p1_f32 v7, v4, attr0.x
+            0xC81D_0004, // v_interp_p2_f32 v7, v4, attr0.x
+        ];
+        // The values read before the vertices, and after.
+        for values_first in [true, false] {
+            let mut words = Vec::new();
+            if values_first {
+                words.push(values);
+            }
+            words.extend(vertices);
+            if !values_first {
+                words.push(values);
+            }
+            words.extend([v_add_f32(7, 7, 6), e0, e1, S_ENDPGM]);
+            let addr = PERSP_CENTROID | LINEAR_CENTER;
+            assert_eq!(texcoord_mode(&pixel(&words, addr).unwrap()), 1);
+            super::lower::TEST_DERIVED_VERTICES.set(Some(true));
+            let shader = pixel(&words, addr);
+            super::lower::TEST_DERIVED_VERTICES.set(None);
+            let shader = shader.unwrap();
+            let (_, inputs) = parts(&shader);
+            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 2);
+            // (the center one of the two: linear center, mode 4)
+            assert_eq!(texcoord_mode(&shader), 4, "values first: {values_first}");
+            validate(&shader);
         }
     }
 

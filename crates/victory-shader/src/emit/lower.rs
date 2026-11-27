@@ -266,6 +266,9 @@ struct Lower<'a> {
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
+    /// The three vertices of an input channel derived from its interpolated
+    /// value (`Lower::derived_vertices`), by element and column.
+    derived: HashMap<(usize, u8), [V; 3]>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
@@ -1514,8 +1517,39 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+pub fn host_settings() -> [u32; 5] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        u32::from(host_derived_vertices()),
+    ]
+}
+
+static HOST_DERIVED_VERTICES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator that the host's `attributeAtVertex` is wrong while
+/// its `SV_Barycentrics` is right (D3DMetal gives 0 for every vertex:
+/// docs/macos.md): a pixel program's float attribute read per vertex is then
+/// interpolated and its vertices derived from it (`Lower::derived_vertices`).
+pub fn set_host_derived_vertices(on: bool) {
+    HOST_DERIVED_VERTICES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_derived_vertices`], for its thread only.
+    pub(super) static TEST_DERIVED_VERTICES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// See [`set_host_derived_vertices`].
+pub(super) fn host_derived_vertices() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_DERIVED_VERTICES.get() {
+        return on;
+    }
+    HOST_DERIVED_VERTICES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2038,6 +2072,7 @@ impl<'a> Lower<'a> {
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
+            derived: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
             bools: HashMap::new(),
@@ -11127,6 +11162,19 @@ impl<'a> Lower<'a> {
                 };
                 (attribute, eval)
             }
+            // P0 of an attribute read per vertex whose vertices are derived:
+            // its element is interpolated, so P0 is derived too.
+            Interp::Vertex {
+                attribute,
+                vertex: 2,
+            } if self.derives_row(attribute.row, attribute.channel) => (
+                attribute,
+                Eval::Weights {
+                    p0: true,
+                    i: None,
+                    j: None,
+                },
+            ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
                 attribute,
@@ -11303,8 +11351,12 @@ impl<'a> Lower<'a> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
+        let derive = matches!(eval, Eval::Weights { .. }) && self.derives_vertices(id);
         let mode = match eval {
             Eval::Mode(mode) => mode,
+            Eval::Weights { .. } if derive => {
+                self.derive_kind().and_then(interp_mode).ok_or("an interpolation")?
+            }
             Eval::Weights { .. } => 1,
         };
         let e = &mut self.s.inputs[id];
@@ -11318,12 +11370,19 @@ impl<'a> Lower<'a> {
                 _ => Err("an input"),
             };
         };
-        let v0 = self.vertex_input(id, col, 0);
+        let vertex = |l: &mut Self, k: u8| -> Result<V, Why> {
+            if derive {
+                Ok(l.derived_vertices(id, col)?[usize::from(k)])
+            } else {
+                Ok(l.vertex_input(id, col, k))
+            }
+        };
+        let v0 = vertex(self, 0)?;
         let c = self.cur;
         let mut acc = p0.then_some(v0);
         for (k, w) in [(1, i), (2, j)] {
             let Some(w) = w else { continue };
-            let vk = self.vertex_input(id, col, k);
+            let vk = vertex(self, k)?;
             let d = self.s.m.bin(c, Bin::Sub, vk, v0);
             acc = Some(match acc {
                 Some(a) => self.fmad(w, d, a),
@@ -11332,6 +11391,153 @@ impl<'a> Lower<'a> {
         }
         let acc = acc.ok_or("an interpolation")?;
         Ok(self.as_int(acc))
+    }
+
+    /// Whether the vertices of attribute row `row`'s channel `ch`, read per
+    /// vertex, are derived from its interpolated value: P0 is then derived
+    /// too, not read flat.
+    fn derives_row(&mut self, row: u8, ch: u8) -> bool {
+        if !host_derived_vertices() || !self.per_vertex(row) {
+            return false;
+        }
+        self.find_input(row, ch).is_some_and(|(id, _)| self.derives_vertices(id))
+    }
+
+    /// Whether the vertices of input element `id` are derived from its
+    /// interpolated value (`Lower::derived_vertices`): on a host whose
+    /// `attributeAtVertex` is wrong ([`set_host_derived_vertices`]), for a
+    /// 32-bit float element (the others cannot be interpolated) of a row
+    /// the console does not hold as 16-bit values, when the program's
+    /// barycentrics leave a kind to weigh it with ([`Lower::derive_kind`]).
+    fn derives_vertices(&mut self, id: usize) -> bool {
+        let e = &self.s.inputs[id];
+        if !host_derived_vertices() || e.comp != 9 || e.half || e.kind != 0 {
+            return false;
+        }
+        let fp16 = match (&self.x.native.io, e.row) {
+            (StageIo::Ps { inputs, .. }, Some(row)) => {
+                inputs.iter().any(|i| u32::from(i.row) == row && i.fp16)
+            }
+            _ => true,
+        };
+        if fp16 {
+            return false;
+        }
+        let Some(kind) = self.derive_kind() else {
+            return false;
+        };
+        matches!(self.barycentric(kind, 0), Val::I32(_))
+    }
+
+    /// The barycentrics derived vertices are weighed with, and their
+    /// element interpolated as: a kind the program declares
+    /// `SV_Barycentrics` for anyway (values it reads, interpolations of rows
+    /// it reads per vertex), a center one first, so that no third is
+    /// needed; perspective center when it has none. None when it has more
+    /// than two (the element is then read per vertex as before).
+    fn derive_kind(&self) -> Option<Barycentric> {
+        let values = self.x.io.inputs.iter().filter_map(|(_, i)| match *i {
+            Input::Barycentric { kind, .. } => Some(kind),
+            _ => None,
+        });
+        let interpolations = self.x.io.interps.iter().filter_map(|(_, i)| match *i {
+            Interp::Interpolated {
+                attribute,
+                barycentric,
+                ..
+            } if self.per_vertex(attribute.row) => Some(barycentric),
+            _ => None,
+        });
+        let mut kinds: Vec<(u8, Barycentric)> = values
+            .chain(interpolations)
+            .filter_map(|k| interp_mode(k).map(|m| (m, k)))
+            .collect();
+        kinds.sort_by_key(|&(m, _)| m);
+        kinds.dedup_by_key(|&mut (m, _)| m);
+        match kinds.len() {
+            0 => Some(Barycentric::PerspectiveCenter),
+            // a center kind first: centroid or sample positions are spaced
+            // unevenly in a quad at an edge, a worse system to solve
+            1 | 2 => Some(kinds.iter().find(|&&(m, _)| m == 2 || m == 4).unwrap_or(&kinds[0]).1),
+            _ => None,
+        }
+    }
+
+    /// The three vertices of channel `col` of input element `id` (declared
+    /// interpolated as [`Lower::derive_kind`]) as floats, 0 the provoking
+    /// vertex, without `attributeAtVertex`: the value is
+    /// A = P0 + i (P1 - P0) + j (P2 - P0) with i and j the `SV_Barycentrics`
+    /// weights of vertices 1 and 2 of that kind, so across the quad
+    /// dA = d1 di + d2 dj for d1 = P1 - P0 and d2 = P2 - P0. The fine
+    /// derivatives of A, i and j in x and y give d1 and d2 (Cramer's rule),
+    /// then P0 = A - i d1 - j d2. Read in the entry block, where every lane
+    /// of the quad runs.
+    /// shortcut: exact in real numbers. In floats dA is A's change across a
+    /// pixel rounded to A's precision, so d1, d2 and P0 are off by about an
+    /// ulp of |A| times the triangle's size in pixels: little relative to
+    /// the vertices' differences when A changes by many ulps per pixel
+    /// (some 1e-5 on the tests' 8x8 triangle), gross for a large value
+    /// changing little per pixel (1e5, an ulp of 0.008, over 100 pixels:
+    /// off by about 1, so no exact ids). P0 cannot be read flat beside it:
+    /// one element has one interpolation mode.
+    fn derived_vertices(&mut self, id: usize, col: u8) -> Result<[V; 3], Why> {
+        if let Some(&v) = self.derived.get(&(id, col)) {
+            return Ok(v);
+        }
+        let entry = self.s.entry;
+        let f32t = self.s.t.f32;
+        let float = |l: &mut Self, v: Val| match v {
+            Val::I32(x) => Ok(l.s.m.cast(entry, Cast::Bitcast, x, f32t)),
+            Val::Missing(w) => Err(w),
+            Val::Bit(_) => Err("an input"),
+        };
+        let kind = self.derive_kind().ok_or("barycentrics of a third interpolation mode")?;
+        let a = self.load_any_input(id, col);
+        let a = float(self, a)?;
+        let i = self.barycentric(kind, 0);
+        let i = float(self, i)?;
+        let j = self.barycentric(kind, 1);
+        let j = float(self, j)?;
+        // DerivFineX (85) and DerivFineY (86).
+        let d = |l: &mut Self, op: u32, x: V| {
+            l.s.op(entry, "unary.f32", Attr::ReadNone, f32t, op, &[x])
+        };
+        let (ax, ay) = (d(self, 85, a), d(self, 86, a));
+        let (ix, iy) = (d(self, 85, i), d(self, 86, i));
+        let (jx, jy) = (d(self, 85, j), d(self, 86, j));
+        let m = &mut self.s.m;
+        // a b - c e, or a b + c e
+        let two = |m: &mut super::bitcode::Module, op: Bin, a: V, b: V, c: V, e: V| {
+            let ab = m.bin(entry, Bin::Mul, a, b);
+            let ce = m.bin(entry, Bin::Mul, c, e);
+            m.bin(entry, op, ab, ce)
+        };
+        let det = two(m, Bin::Sub, ix, jy, jx, iy);
+        let n1 = two(m, Bin::Sub, ax, jy, ay, jx);
+        let n2 = two(m, Bin::Sub, ix, ay, iy, ax);
+        let d1 = m.bin(entry, Bin::SDiv, n1, det);
+        let d2 = m.bin(entry, Bin::SDiv, n2, det);
+        // A line (j is 0) or a point (i too) has no 2x2 system: on a line
+        // dA = d1 di, so d1 = (dA . di) / (di . di); on a point both are 0
+        // and P0 is A.
+        let zero = m.f32(0);
+        let flat = m.cmp(entry, pred::OEQ, det, zero);
+        let ii = two(m, Bin::Add, ix, ix, iy, iy);
+        let ai = two(m, Bin::Add, ax, ix, ay, iy);
+        let line = m.bin(entry, Bin::SDiv, ai, ii);
+        let point = m.cmp(entry, pred::OEQ, ii, zero);
+        let line = m.select(entry, point, zero, line);
+        let d1 = m.select(entry, flat, line, d1);
+        let d2 = m.select(entry, flat, zero, d2);
+        let id1 = m.bin(entry, Bin::Mul, i, d1);
+        let jd2 = m.bin(entry, Bin::Mul, j, d2);
+        let p0 = m.bin(entry, Bin::Sub, a, id1);
+        let p0 = m.bin(entry, Bin::Sub, p0, jd2);
+        let p1 = m.bin(entry, Bin::Add, p0, d1);
+        let p2 = m.bin(entry, Bin::Add, p0, d2);
+        let v = [p0, p1, p2];
+        self.derived.insert((id, col), v);
+        Ok(v)
     }
 
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
