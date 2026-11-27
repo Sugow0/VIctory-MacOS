@@ -635,7 +635,7 @@ mod tests {
 
     /// Whether `code` is a `cmpxchg` (0f b0, 0f b1) run under Wine, that is
     /// under Rosetta 2 on Apple silicon, which does it otherwise than the
-    /// processor (issue #15), in all sizes, locked or not: it leaves the
+    /// processor (Sugow0/VIctory-MacOS#15), in all sizes, locked or not: it leaves the
     /// flags of `cmp [mem], accumulator` and not of `cmp accumulator, [mem]`
     /// (al 80h against 0: CF, OF and SF, 881h, where the processor leaves
     /// SF, 80h), and a 4 byte one that finds eax equal clears the top of rax,
