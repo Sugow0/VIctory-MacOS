@@ -67,6 +67,21 @@ fn software(desc: &DXGI_ADAPTER_DESC1) -> bool {
         || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
 }
 
+/// The device's `WaveLaneCountMin..=WaveLaneCountMax`, if it answers.
+pub fn wave_lanes(device: &ID3D12Device) -> Option<std::ops::RangeInclusive<u32>> {
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a feature structure of the requested type and size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    }
+    .ok()?;
+    Some(waves.WaveLaneCountMin..=waves.WaveLaneCountMax)
+}
+
 fn adapter_matches(requested: &str, index: u32, name: &str) -> bool {
     if let Ok(wanted) = requested.parse::<u32>() {
         wanted == index
@@ -374,6 +389,17 @@ impl Host {
         root: &ID3D12RootSignature,
         cs: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        // A wave size the device does not run is refused here, as a driver
+        // refuses it (NVIDIA's); D3DMetal takes it and runs the program wrong.
+        if let (Some(n), Some(lanes)) = (super::wanted_wave(cs), wave_lanes(&self.device))
+            && !lanes.contains(&n)
+        {
+            return Err(format!(
+                "WaveSize({n}) outside the device's waves of {} to {} lanes",
+                lanes.start(),
+                lanes.end()
+            ));
+        }
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the descriptor never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(root) },

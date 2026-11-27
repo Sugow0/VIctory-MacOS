@@ -460,8 +460,46 @@ pub fn emit_with_retries(
     }
 }
 
+/// Refusal of a program whose `WaveSize` is wider than the host's waves.
+pub(crate) const WIDER_THAN_HOST: &str = "a wave size wider than the host's waves";
+
+/// The wave size a DXIL container's program asks for (`WaveSize(n)`: PSV0's
+/// expected lane counts, equal), if it asks for one.
+pub(crate) fn wanted_wave(dxil: &[u8]) -> Option<u32> {
+    let c = Container::parse(dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?.data;
+    // (after the runtime info's size)
+    let at = |o: usize| Some(u32::from_le_bytes(psv.get(4 + o..8 + o)?.try_into().ok()?));
+    let (min, max) = (at(16)?, at(20)?);
+    (min != 0 && min == max).then_some(min)
+}
+
 /// Emits a program whose earlier stages already ran.
+///
+/// A program still asking for waves wider than the host's
+/// ([`set_host_max_wave`]) is refused: a driver that checks refuses its
+/// pipeline (NVIDIA's), one that does not (D3DMetal's) runs it wrong.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    within_host_wave(emit_any_wave(c, native, p, st, io, res)?, lower::host_max_wave())
+}
+
+/// `shader`, unless it asks for waves wider than `host` lanes (0: not known).
+pub(crate) fn within_host_wave(shader: HostShader, host: u32) -> Result<HostShader, ShaderError> {
+    if host != 0 && wanted_wave(&shader.dxil).is_some_and(|n| n > host) {
+        return Err(ShaderError::Unsupported { offset: 0, what: WIDER_THAN_HOST });
+    }
+    Ok(shader)
+}
+
+/// [`emit`] for any wave size.
+fn emit_any_wave(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

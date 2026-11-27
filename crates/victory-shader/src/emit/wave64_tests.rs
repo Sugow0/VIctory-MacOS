@@ -224,7 +224,46 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
 /// both tests become -1 or 0 and SCC of `timeout | ~waiting` ends it.
 #[test]
 fn some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on() {
-    let native = native(&[
+    let native = some_lane_program();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = on_64_lanes(&native, &p);
+    // (lane s0 waits, if there is one; s1 rounds)
+    for (wait, rounds, done) in [(0, 0, 0), (37, 4, 0), (63, 4, 0), (64, 0, 1), (37, 5, 1), (64, 9, 1)] {
+        let Some(out) = dispatched(&shader, &[wait, rounds]) else {
+            return;
+        };
+        assert_eq!(out, done, "lane {wait} after {rounds} rounds");
+    }
+}
+
+/// A program translated for 64-lane waves is refused on a host of 32-lane
+/// waves, not left to a pipeline a driver may take and run wrong
+/// (D3DMetal's); a host of 64-lane waves, or one not known, gets it.
+#[test]
+fn a_wave_wider_than_the_hosts_is_refused() {
+    let native = some_lane_program();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = on_64_lanes(&native, &p);
+    assert_eq!(super::wanted_wave(&shader.dxil), Some(64));
+    match super::within_host_wave(shader.clone(), 32) {
+        Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, super::WIDER_THAN_HOST),
+        Err(e) => panic!("refused for another reason: {e}"),
+        Ok(_) => panic!("WaveSize(64) taken on a host of 32-lane waves"),
+    }
+    for host in [64, 0] {
+        assert!(super::within_host_wave(shader.clone(), host).is_ok(), "host of {host} lanes");
+    }
+    // (a program asking for no wave size runs on any host)
+    let plain = native_of(&[], false, 32);
+    let p = ir::build(&plain.code, plain.wave64, plain.vgprs).expect("ir::build");
+    let any = lowered(&plain, &p, &HashSet::new()).expect("lower");
+    assert_eq!(super::wanted_wave(&any.dxil), None);
+    assert!(super::within_host_wave(any, 32).is_ok());
+}
+
+/// [`some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on`]'s program.
+fn some_lane_program() -> NativeProgram {
+    native(&[
         0xD765_0001,
         0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
         0xD766_0001,
@@ -239,16 +278,7 @@ fn some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on() {
         0x7E04_0206, // v_mov_b32 v2, s6
         0xE070_0000,
         0x8002_0200, // buffer_store_dword v2, off, s[8:11], 0
-    ]);
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = on_64_lanes(&native, &p);
-    // (lane s0 waits, if there is one; s1 rounds)
-    for (wait, rounds, done) in [(0, 0, 0), (37, 4, 0), (63, 4, 0), (64, 0, 1), (37, 5, 1), (64, 9, 1)] {
-        let Some(out) = dispatched(&shader, &[wait, rounds]) else {
-            return;
-        };
-        assert_eq!(out, done, "lane {wait} after {rounds} rounds");
-    }
+    ])
 }
 
 /// `native` for a host of 64-lane waves.
