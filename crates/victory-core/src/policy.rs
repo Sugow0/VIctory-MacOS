@@ -64,22 +64,21 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
 
 /// Canonicalizes the longest existing prefix of `path` and re-appends the
 /// rest, so that paths which do not exist yet can still be compared.
+///
+/// The prefix is handed to the system as given, never joined to the current
+/// directory first: on Windows a rooted path without a drive (`\x`, or a Unix
+/// path under Wine) is not `is_absolute()`, and only the system knows which
+/// file opening it would reach. An empty prefix is the current directory.
 fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|source| PolicyError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .join(path)
-    };
-
-    let mut existing = absolute.as_path();
+    let mut existing = path;
     let mut rest = Vec::new();
     loop {
-        match std::fs::canonicalize(existing) {
+        let probe = if existing.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            existing
+        };
+        match std::fs::canonicalize(probe) {
             Ok(canon) => {
                 let mut out = canon;
                 for component in rest.iter().rev() {
@@ -168,5 +167,13 @@ mod tests {
         let path = base.join("a").join("..").join("b");
         let resolved = resolve(&path).expect("a `..` in the missing tail must resolve lexically");
         assert_eq!(resolved, resolve(&base.join("b")).unwrap());
+    }
+
+    #[test]
+    fn resolves_a_relative_path_against_the_current_directory() {
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let path = Path::new("victory-policy-no-such").join("x");
+        assert_eq!(resolve(&path).unwrap(), cwd.join("victory-policy-no-such").join("x"));
+        assert_eq!(resolve(Path::new("..")).unwrap(), normalize(&cwd.join("..")));
     }
 }
