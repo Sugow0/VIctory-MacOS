@@ -10,6 +10,7 @@
 # --unpaced       no frame clock (VICTORY_FRAME_INTERVAL_MS=0): as fast as presents go (vsync: 120 Hz on a ProMotion Mac)
 # --clears N      a load: N more clears of the target per frame (default 0)
 # --copies N      a load: N copies of the target per frame, each between two barriers (default 0)
+#                 (the loads need a title built from this script's fixture: --no-build with an older one runs without)
 # --env K=V       a VIctory switch for the run (K starts with VICTORY_; repeatable; e.g. VICTORY_GPU_TIMING=1 with --build diag)
 # --exit-code C   the title returns C (non-zero: the check must fail)
 # --build B       release (the default) or diag (diagnostics, as play-macos.sh plays)
@@ -24,7 +25,7 @@ set -euo pipefail
 # Decimal points in the numbers read and printed, whatever the locale.
 export LC_ALL=C
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "smoke-macos: $*" >&2; exit 1; }
 
 frames=
@@ -59,6 +60,8 @@ case "$frames" in ''|*[!0-9]*) die "--frames takes a whole number" ;; esac
 case "$exit_code" in ''|*[!0-9]*) die "--exit-code takes a whole number" ;; esac
 case "$clears" in ''|*[!0-9]*) die "--clears takes a whole number" ;; esac
 case "$copies" in ''|*[!0-9]*) die "--copies takes a whole number" ;; esac
+# As numbers (a leading 0 is not octal): 00 is no load.
+clears=$((10#$clears)); copies=$((10#$copies))
 case "$timeout" in ''|*[!0-9]*) die "--timeout takes a whole number" ;; esac
 case "$build" in
     release) build_args=(--locked --release -p victory); profile=release ;;
