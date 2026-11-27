@@ -342,6 +342,13 @@ launchctl kickstart gui/$(id -u)/com.victory.verify-macos   # run it now
 scripts/install-verify-agent.sh uninstall
 ```
 
+Install it from a checkout outside `~/Documents`, `~/Desktop` and
+`~/Downloads`: macOS privacy protection denies launchd jobs access to those
+folders, and the agent's `/bin/bash` then fails with "Operation not
+permitted" before the script runs. A clone of its own, for instance
+`git clone <repo> ~/Developer/victory-verify` checked out on `port-macos`,
+keeps the agent off the working copy you edit.
+
 Its state is in `~/Library/Application Support/victory-verify`: `last` (the
 sha verified last; delete it to verify again), `last-result`, `agent.log` and
 `logs/`, one folder per run. `scripts/verify-agent-run.sh` is the job itself
