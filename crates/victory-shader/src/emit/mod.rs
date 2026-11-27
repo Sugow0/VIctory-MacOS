@@ -3206,6 +3206,20 @@ mod barycentric_tests {
                 if d3dmetal && !derived {
                     continue;
                 }
+                // WARP's `SV_Barycentrics` are off once the vertices' w
+                // differ: they do not weigh the vertices into the value WARP
+                // interpolates itself. On the GitHub runners, at the last
+                // pixel, i, j = 0.11364, 1.02273 for 0.22727, 0.68182, so
+                // 2 + 4i + 8j = 10.64 where WARP's TEXCOORD is 8.36 (the
+                // perspective-correct value, as `attributeAtVertex` gives).
+                // Derived vertices rest on that sum (a first half of
+                // interpolation, all w = 1, checks them on WARP); hardware
+                // and D3DMetal get it right.
+                // (`Host::new` gives WARP for hardware too with `VICTORY_WARP=1`.)
+                if (warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1")) && derived {
+                    eprintln!("WARP's barycentrics are off with uneven w; derived vertices skipped there");
+                    continue;
+                }
                 for (body, want) in &cases {
                     let mut words = body.clone();
                     words.extend([e0, e1, S_ENDPGM]);

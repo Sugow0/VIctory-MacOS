@@ -1215,7 +1215,8 @@ mod tests {
 
     /// A graphics pipeline with `DepthBoundsTestEnable` loads back from the
     /// pipeline library and culls or passes fragments according to
-    /// `OMSetDepthBounds` (including across a command-list cut).
+    /// `OMSetDepthBounds` (including across a command-list cut), with the
+    /// depth test off and with it on and always passing.
     #[test]
     fn depth_bounds_pipeline_loads_and_filters_draws() {
         let Some(host) = host() else {
@@ -1380,7 +1381,15 @@ mod tests {
             out.unwrap()
         };
 
-        let run_draw = |min: f32, max: f32| -> u8 {
+        // The same with the depth test on and always passing: depth bounds
+        // alone still gates the draw.
+        let mut depth_on = g.depth1();
+        depth_on.DepthEnable = true.into();
+        let pso_depth_on =
+            graphics_depth_bounds_pipeline(&host.device, &root, &desc, depth_on, &format!("{name}, depth test on"))
+                .expect("depth-bounds PSO with the depth test on made");
+
+        let run_draw = |pso: &ID3D12PipelineState, min: f32, max: f32| -> u8 {
             let mut state = crate::draw::State::default();
             let first_list = host.new_list().unwrap();
             state.set_depth_bounds(&first_list, min, max);
@@ -1412,7 +1421,7 @@ mod tests {
                 list.list.RSSetViewports(&[vp]);
                 list.list.RSSetScissorRects(&[rect]);
                 list.list.SetGraphicsRootSignature(&root);
-                list.list.SetPipelineState(&pso);
+                list.list.SetPipelineState(pso);
                 list.list
                     .IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 list.list.DrawInstanced(3, 1, 0, 0);
@@ -1461,8 +1470,29 @@ mod tests {
             }
         };
 
-        assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
-        assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+        // WARP (the Microsoft Basic Render Driver, 0x1414:0x8c) reports
+        // `DepthBoundsTestSupported` but applies the test only with the depth
+        // test on: with `DepthEnable` false every fragment passes, even for
+        // an inverted range, which the spec says always fails (seen on the
+        // GitHub runners, which have no GPU). Hardware and D3DMetal apply it
+        // either way, as the spec ties it to no other state.
+        // SAFETY: plain DXGI adapter queries.
+        let warp = unsafe {
+            windows::Win32::Graphics::Dxgi::CreateDXGIFactory2::<windows::Win32::Graphics::Dxgi::IDXGIFactory4>(
+                windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS(0),
+            )
+            .and_then(|f| f.EnumAdapterByLuid::<windows::Win32::Graphics::Dxgi::IDXGIAdapter1>(host.device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+        }
+        .is_ok_and(|d| (d.VendorId, d.DeviceId) == (0x1414, 0x8c));
+        if warp {
+            eprintln!("WARP ignores depth bounds with the depth test off; that case skipped");
+        } else {
+            assert_eq!(run_draw(&pso, 0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
+            assert_eq!(run_draw(&pso, 0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+        }
+        assert_eq!(run_draw(&pso_depth_on, 0.6, 1.0), 0, "depth test on: depth 0.5 outside [0.6, 1.0] must be rejected");
+        assert_eq!(run_draw(&pso_depth_on, 0.4, 0.6), 255, "depth test on: depth 0.5 inside [0.4, 0.6] must pass");
     }
 
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
