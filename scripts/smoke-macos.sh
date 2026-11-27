@@ -5,9 +5,12 @@
 # exited with 0 and that the frame meter logged frame times; prints their
 # median. No game data. (apps/victory/tests/smoke_title.rs is the same check
 # on Windows.)
-#   scripts/smoke-macos.sh [--frames N] [--unpaced] [--exit-code C] [--build release|diag] [--no-build] [--timeout S]
+#   scripts/smoke-macos.sh [--frames N] [--unpaced] [--clears N] [--copies N] [--env VICTORY_X=V]... [--exit-code C] [--build release|diag] [--no-build] [--timeout S]
 # --frames N      frames the title presents (default 1200: 20 s at its 60 Hz; 3600 unpaced; the meter logs every 5 s)
 # --unpaced       no frame clock (VICTORY_FRAME_INTERVAL_MS=0): as fast as presents go (vsync: 120 Hz on a ProMotion Mac)
+# --clears N      a load: N more clears of the target per frame (default 0)
+# --copies N      a load: N copies of the target per frame, each between two barriers (default 0)
+# --env K=V       a VIctory switch for the run (K starts with VICTORY_; repeatable; e.g. VICTORY_GPU_TIMING=1 with --build diag)
 # --exit-code C   the title returns C (non-zero: the check must fail)
 # --build B       release (the default) or diag (diagnostics, as play-macos.sh plays)
 # --no-build      use what the last build left
@@ -21,12 +24,15 @@ set -euo pipefail
 # Decimal points in the numbers read and printed, whatever the locale.
 export LC_ALL=C
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "smoke-macos: $*" >&2; exit 1; }
 
 frames=
 unpaced=0
 exit_code=0
+clears=0
+copies=0
+switches=()
 build=release
 do_build=1
 timeout=180
@@ -34,6 +40,12 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --frames) [ $# -ge 2 ] || die "--frames needs a number"; frames=$2; shift 2 ;;
         --unpaced) unpaced=1; shift ;;
+        --clears) [ $# -ge 2 ] || die "--clears needs a number"; clears=$2; shift 2 ;;
+        --copies) [ $# -ge 2 ] || die "--copies needs a number"; copies=$2; shift 2 ;;
+        --env)
+            [ $# -ge 2 ] || die "--env needs VICTORY_X=V"
+            case "$2" in VICTORY_*=*) ;; *) die "--env takes VICTORY_X=V, not '$2'" ;; esac
+            switches+=("$2"); shift 2 ;;
         --exit-code) [ $# -ge 2 ] || die "--exit-code needs a number"; exit_code=$2; shift 2 ;;
         --build) [ $# -ge 2 ] || die "--build needs release or diag"; build=$2; shift 2 ;;
         --no-build) do_build=0; shift ;;
@@ -45,6 +57,8 @@ done
 [ -n "$frames" ] || { [ "$unpaced" = 1 ] && frames=3600 || frames=1200; }
 case "$frames" in ''|*[!0-9]*) die "--frames takes a whole number" ;; esac
 case "$exit_code" in ''|*[!0-9]*) die "--exit-code takes a whole number" ;; esac
+case "$clears" in ''|*[!0-9]*) die "--clears takes a whole number" ;; esac
+case "$copies" in ''|*[!0-9]*) die "--copies takes a whole number" ;; esac
 case "$timeout" in ''|*[!0-9]*) die "--timeout takes a whole number" ;; esac
 case "$build" in
     release) build_args=(--locked --release -p victory); profile=release ;;
@@ -109,13 +123,16 @@ windows_path() {
 }
 log="$work/run.log"
 
-# None of the developer's switches: the run as it is by default.
+# None of the developer's switches (only those given with --env): the run as it is by default.
 for key in $(env | sed -n 's/^\(VICTORY_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$key"; done
 env_args=(VICTORY_LOG=info VICTORY_CACHE_DIR="$(windows_path "$work/cache")" VICTORY_DATA_DIR="$(windows_path "$work/data")")
 [ "$unpaced" = 1 ] && env_args+=(VICTORY_FRAME_INTERVAL_MS=0)
-echo "smoke-macos: $frames frames$([ "$unpaced" = 1 ] && echo ', unpaced'), $where, log $log"
+env_args+=(${switches[@]+"${switches[@]}"})
+title_args=("$frames" "$exit_code")
+[ "$clears" = 0 ] && [ "$copies" = 0 ] || title_args+=("$clears" "$copies")
+echo "smoke-macos: $frames frames$([ "$unpaced" = 1 ] && echo ', unpaced')$([ "$clears" = 0 ] || echo ", $clears more clears a frame")$([ "$copies" = 0 ] || echo ", $copies copies a frame"), $where, log $log"
 started=$(date +%s)
-env "${env_args[@]}" "$wine" ${wine_args[@]+"${wine_args[@]}"} "$victory" run "$(windows_path "$work/smoke-title.exe")" --execute -- "$frames" "$exit_code" >"$log" 2>&1 &
+env "${env_args[@]}" "$wine" ${wine_args[@]+"${wine_args[@]}"} "$victory" run "$(windows_path "$work/smoke-title.exe")" --execute -- "${title_args[@]}" >"$log" 2>&1 &
 pid=$!
 timed_out=0
 while kill -0 "$pid" 2>/dev/null; do
