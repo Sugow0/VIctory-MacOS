@@ -77,11 +77,24 @@ What the runtime chooses from a capability it reports:
 What it reports and does otherwise (the tests skip these checks on D3DMetal
 alone, `emit::host::on_d3dmetal`: under Wine with that adapter name):
 
-- **Barycentrics.** Reported, but a pixel shader reading `SV_Barycentrics`
-  with an attribute per vertex (`GetAttributeAtVertex`, the translation of
-  a lone `v_interp_p1_f32`) gives 0. Not worked around: the attributes of
-  the three vertices would have to reach the pixel shader another way (a
-  geometry or mesh stage passing them per primitive).
+- **Barycentrics.** Reported, and `SV_Barycentrics` is right (perspective
+  and linear weights), as are interpolated and flat inputs; but
+  `attributeAtVertex` (`GetAttributeAtVertex`) gives 0 for every vertex,
+  whatever the vertex shader declares for the output. The translator reads
+  vertices for an attribute the console program reads per vertex (computed
+  i or j, P10 or P20, a lone `v_interp_p1_f32`). On D3DMetal
+  (`emit::set_host_derived_vertices`, set from `on_d3dmetal` in
+  `crates/victory-gpu/src/host.rs`, part of the translation fingerprint)
+  such a float attribute is declared perspective-interpolated instead and
+  its vertices are derived from it: A = P0 + i (P1 - P0) + j (P2 - P0), so
+  the fine derivatives of A, i and j across the quad give P1 - P0 and
+  P2 - P0, and P0 = A - i (P1 - P0) - j (P2 - P0)
+  (`Lower::derived_vertices`). Exact in real numbers; in floats the error
+  grows with the triangle's size in pixels (about 4e-5 of the value on an
+  8x8 test with one vertex at w = 3). Integer and 16-bit attributes still
+  use `attributeAtVertex` (wrong there). Elsewhere the DXIL is unchanged.
+  The barycentrics tests run on D3DMetal with the vertices derived only,
+  elsewhere both ways.
 - **Sine and cosine of NaN** give a number (sin(NaN) = 0 in f32 and f16)
   where D3D12 and the console give NaN, likely Metal's fast math. The tests
   leave infinities unchecked there too; finite inputs are right.
