@@ -3393,7 +3393,8 @@ mod barycentric_tests {
 
     /// With the vertices derived, a program that already reads two kinds
     /// of barycentrics (perspective centroid and linear center, as values)
-    /// gets no third: the element is interpolated as one of them.
+    /// gets no third: the element is interpolated as one of them, the
+    /// center one.
     #[test]
     fn derived_vertices_take_a_mode_the_program_has() {
         const PERSP_CENTROID: u32 = 1 << 2;
@@ -3423,7 +3424,8 @@ mod barycentric_tests {
             let shader = shader.unwrap();
             let (_, inputs) = parts(&shader);
             assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 2);
-            assert_eq!(texcoord_mode(&shader), 3, "values first: {values_first}");
+            // (the center one of the two: linear center, mode 4)
+            assert_eq!(texcoord_mode(&shader), 4, "values first: {values_first}");
             validate(&shader);
         }
     }

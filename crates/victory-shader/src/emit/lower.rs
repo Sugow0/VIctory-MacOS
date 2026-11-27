@@ -11432,9 +11432,9 @@ impl<'a> Lower<'a> {
     /// The barycentrics derived vertices are weighed with, and their
     /// element interpolated as: a kind the program declares
     /// `SV_Barycentrics` for anyway (values it reads, interpolations of rows
-    /// it reads per vertex), the first in DXIL's order, so that no third is
+    /// it reads per vertex), a center one first, so that no third is
     /// needed; perspective center when it has none. None when it has more
-    /// than two.
+    /// than two (the element is then read per vertex as before).
     fn derive_kind(&self) -> Option<Barycentric> {
         let values = self.x.io.inputs.iter().filter_map(|(_, i)| match *i {
             Input::Barycentric { kind, .. } => Some(kind),
@@ -11456,7 +11456,9 @@ impl<'a> Lower<'a> {
         kinds.dedup_by_key(|&mut (m, _)| m);
         match kinds.len() {
             0 => Some(Barycentric::PerspectiveCenter),
-            1 | 2 => Some(kinds[0].1),
+            // a center kind first: centroid or sample positions are spaced
+            // unevenly in a quad at an edge, a worse system to solve
+            1 | 2 => Some(kinds.iter().find(|&&(m, _)| m == 2 || m == 4).unwrap_or(&kinds[0]).1),
             _ => None,
         }
     }

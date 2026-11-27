@@ -100,7 +100,8 @@ alone, `emit::host::on_d3dmetal`: under Wine with that adapter name):
   or index read per vertex is not exact. P0, read flat and exact before,
   is derived too on such a row: one input element has one interpolation
   mode, and the vertex shader's output cannot be read twice. Integer and
-  16-bit attributes still use `attributeAtVertex` (wrong there). Elsewhere
+  16-bit attributes, and every attribute of a program that uses more than
+  two kinds of barycentrics, still use `attributeAtVertex` (wrong there). Elsewhere
   the DXIL is unchanged. The barycentrics tests run on D3DMetal with the
   vertices derived only, elsewhere both ways.
 - **Sine and cosine of NaN** give a number (sin(NaN) = 0 in f32 and f16)
