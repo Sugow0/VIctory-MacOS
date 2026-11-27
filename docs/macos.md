@@ -95,6 +95,27 @@ alone, `emit::host::on_d3dmetal`: under Wine with that adapter name):
   pipeline, and `D3D12CreateRootSignatureDeserializer` takes a truncated
   root signature (`S_OK`): a damaged blob is not caught there as on
   Windows.
+- **CPU descriptor handles are no addresses.** CrossOver's d3d12 hands out
+  encoded handles (D3D12 says they are opaque), so reading a descriptor
+  through its handle fails (error 299). The AMD "raw twin" trick, which
+  moves a raw buffer view that begins off 16 bytes by rewriting its
+  descriptor (`descriptor::host::move_raw`), cannot work there: such twins
+  are made null and counted (`TWINS[2]`), as on any host whose descriptors
+  are not what it expects. The staged descriptor copy-in is unaffected. The
+  two `descriptor::host` tests that read descriptors skip under Wine when
+  the handle cannot be read, and fail elsewhere.
+
+Wine's memory (not D3DMetal's):
+
+- **Placeholders look like reservations.** Wine has no
+  `NtQueryVirtualMemory` class 7 (`STATUS_INVALID_INFO_CLASS`) and
+  `VirtualQuery` shows a placeholder as a plain reservation. The GPU side
+  finds that out once (`watch::host_tells_placeholders`) and then asks the
+  runtime's own record of the placeholders it made (`XMemVirtualAlloc` tells
+  `victory_gpu::title_placeholder_reserved`; allocations and frees there
+  take their range out), so holes in streamed pools are known as on
+  Windows instead of asked about at every refresh. On Windows the host is
+  asked, as before.
 
 ## What you need
 
