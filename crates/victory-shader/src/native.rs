@@ -72,6 +72,10 @@
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{u32_at, u64_at};
 
+#[cfg(any(test, feature = "synth"))]
+#[doc(hidden)]
+pub mod synth;
+
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
 const KIND_NATIVE: u32 = 0x0d;
@@ -870,6 +874,7 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::synth::{dxil_part as part, xbch};
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const PS_CODE: [u8; 4] = [9, 10, 11, 12];
@@ -900,63 +905,18 @@ mod tests {
 
     /// FSSM blob with `programs` as (stage, code) pairs.
     fn fssm(programs: &[(HwStage, &[u8])]) -> Vec<u8> {
-        let mut payload = GRAPHICS_SLOT_COUNT.to_le_bytes().to_vec();
-        payload.resize(slot(HwStage::Cs) + 8, 0);
-        for (_, at) in SLOTS {
-            payload[at..at + 8].copy_from_slice(&ABSENT.to_le_bytes());
-        }
-        for &(stage, code) in programs {
-            let slot = slot(stage);
-            let record = payload.len() as u64;
-            payload[slot..slot + 8].copy_from_slice(&record.to_le_bytes());
-            let code_at = record + RECORD_SIZE + STAGE_DATA as u64;
-            payload.extend_from_slice(&code_at.to_le_bytes());
-            payload.extend_from_slice(&(code.len() as u64).to_le_bytes());
-            let flags = if stage == HwStage::Ps { FLAG_WAVE32 } else { 0 };
-            payload.extend_from_slice(&[0; 4]);
-            payload.extend_from_slice(&flags.to_le_bytes());
-            payload.resize(record as usize + RECORD_REGS, 0);
-            payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
-            payload.extend_from_slice(&empty_stage_data());
-            payload.extend_from_slice(code);
-        }
-        let mut out = b"FSSM".to_vec();
-        out.extend_from_slice(&FSSM_VERSION.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        out.extend_from_slice(&payload);
-        out
-    }
-
-    fn xbch(unpacked: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; zlib_rs::compress_bound(unpacked.len())];
-        let (stream, rc) =
-            zlib_rs::compress_slice(&mut buf, unpacked, zlib_rs::DeflateConfig::new(6));
-        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
-        let mut out = b"XBCH".to_vec();
-        out.extend_from_slice(&XBCH_VERSION.to_le_bytes());
-        out.extend_from_slice(&(stream.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(unpacked.len() as u64).to_le_bytes());
-        out.extend_from_slice(stream);
-        out
-    }
-
-    /// `DXIL` part data: program header, XDAT index, then the blobs.
-    fn part(blobs: &[(u32, &[u8])]) -> Vec<u8> {
-        let mut out = vec![0u8; XDAT_OFFSET];
-        out.extend_from_slice(b"XDAT");
-        out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
-        out.extend_from_slice(&0x24u32.to_le_bytes());
-        let mut offset = out.len() + 12 * blobs.len();
-        for (kind, blob) in blobs {
-            for v in [*kind, offset as u32, blob.len() as u32] {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            offset += blob.len();
-        }
-        for (_, blob) in blobs {
-            out.extend_from_slice(blob);
-        }
-        out
+        let data = empty_stage_data();
+        let programs: Vec<_> = programs
+            .iter()
+            .map(|&(stage, code)| synth::Program {
+                stage,
+                wave32: stage == HwStage::Ps,
+                regs: VGPRS | 31 << 20,
+                stage_data: &data,
+                code,
+            })
+            .collect();
+        synth::fssm(&programs)
     }
 
     #[test]
