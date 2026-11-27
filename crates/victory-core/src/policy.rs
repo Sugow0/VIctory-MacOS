@@ -170,6 +170,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_the_compiled_path_as_written() {
+        // As the build wrote it, not canonicalized: under Wine on a Mac a
+        // build's path is rooted with no drive (`/Users/...`).
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such").join("x");
+        assert!(matches!(ensure_outside_repo(&path), Err(PolicyError::InsideRepo { .. })));
+    }
+
+    #[test]
+    fn rejects_relative_paths_into_the_repo() {
+        let cwd = std::env::current_dir().unwrap();
+        if ensure_outside_repo(&cwd).is_ok() {
+            eprintln!("the tests do not run inside the repository; skipped");
+            return;
+        }
+        for path in ["no-such/x", "no-such/../x", "no-such/../../no-such"] {
+            assert!(
+                matches!(ensure_outside_repo(Path::new(path)), Err(PolicyError::InsideRepo { .. })),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
     fn resolves_a_relative_path_against_the_current_directory() {
         let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         let path = Path::new("victory-policy-no-such").join("x");
