@@ -5407,6 +5407,22 @@ mod tests {
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4), None);
     }
 
+    /// Whether the host's CPU descriptor handle `at` is the address of its
+    /// descriptor, as these tests read it. D3D12 makes no such promise;
+    /// CrossOver's d3d12 hands out handles that are no address (the read
+    /// fails, error 299), so the raw twins cannot be moved there
+    /// ([`move_raw`]: they are made null and counted in `TWINS[2]`). Under
+    /// Wine such a host skips the test; elsewhere it fails it.
+    fn handles_are_addresses(at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+        let mut byte = [0u8; 1];
+        if crate::host::read_into(at.ptr as *const u8, &mut byte) {
+            return true;
+        }
+        assert!(crate::safecopy::on_wine(), "a descriptor handle that is no address, outside Wine: {:#x}", at.ptr);
+        eprintln!("skipped: the host's descriptor handles are no addresses (CrossOver's d3d12: {:#x})", at.ptr);
+        false
+    }
+
     /// What a slot is made as is made beside the heap and copied in whole: the
     /// slot's descriptor is the one the view has, and each thread makes its
     /// own.
@@ -5421,6 +5437,9 @@ mod tests {
         let (Some(a), Some(b)) = (staged(false, 0), staged(false, 1)) else {
             return;
         };
+        if !handles_are_addresses(a) {
+            return;
+        }
         assert_ne!(a.ptr, b.ptr);
         assert_ne!(Some(a.ptr), std::thread::spawn(|| staged(false, 0).map(|h| h.ptr)).join().unwrap());
         let (buffer, _) = host.shared_buffer(1 << 16).unwrap();
@@ -5446,6 +5465,9 @@ mod tests {
         let (Some(host), Some(at)) = (host(), staged(false, 1)) else {
             return; // no host GPU here
         };
+        if !handles_are_addresses(at) {
+            return;
+        }
         let (buffer, _) = host.shared_buffer(1 << 16).unwrap();
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
