@@ -490,6 +490,12 @@ pub fn emit(
     within_host_wave(emit_any_wave(c, native, p, st, io, res)?, lower::host_max_wave())
 }
 
+/// `shader`, unless it asks for waves wider than this host's waves; for a
+/// translation that did not go through [`emit`] (one read from a cache).
+pub fn fits_host_wave(shader: HostShader) -> Result<HostShader, ShaderError> {
+    within_host_wave(shader, lower::host_max_wave())
+}
+
 /// `shader`, unless it asks for waves wider than `host` lanes (0: not known).
 pub(crate) fn within_host_wave(shader: HostShader, host: u32) -> Result<HostShader, ShaderError> {
     if host != 0 && wanted_wave(&shader.dxil).is_some_and(|n| n > host) {
