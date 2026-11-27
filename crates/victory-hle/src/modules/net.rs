@@ -31,6 +31,7 @@ use crate::{HleExport, HleModule, hle_export};
 const SOCKET_ERROR: i32 = -1;
 const INVALID_SOCKET: Socket = !0;
 const WSAEINVAL: i32 = 10022;
+const WSAEOPNOTSUPP: i32 = 10045;
 const WSAEADDRNOTAVAIL: i32 = 10049;
 const WSAENETUNREACH: i32 = 10051;
 const WSASERVICE_NOT_FOUND: i32 = 10108;
@@ -74,6 +75,17 @@ fn once(what: &'static str, destination: String) {
         tracing::info!(%destination, "{what}");
         seen.push((what, destination));
     }
+}
+
+/// The host's own function, if it has one: Wine's ws2_32 lacks a few
+/// newer exports the HLE overrides.
+macro_rules! host_if_any {
+    ($dll:literal, $name:literal: $ty:ty) => {{
+        static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let address = *ADDRESS.get_or_init(|| crate::host::function($dll, $name));
+        // SAFETY: the host exports this function with this signature.
+        address.map(|a| unsafe { std::mem::transmute::<usize, $ty>(a) })
+    }};
 }
 
 fn wsa_error(code: i32) {
@@ -320,7 +332,12 @@ pub extern "system" fn WSAConnectByList(
             return 0;
         }
     }
-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
+    let Some(host) = host_if_any!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)
+    else {
+        wsa_error(WSAEOPNOTSUPP);
+        return 0;
+    };
+    host(
         s, list, local_len, local, remote_len, remote, timeout, reserved,
     )
 }
@@ -588,7 +605,13 @@ pub extern "system" fn GetAddrInfoExA(
     if !resolvable(narrow(name)) {
         return blocked_lookup(result);
     }
-    host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
+    let Some(host) = host_if_any!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)
+    else {
+        blocked_lookup(result);
+        wsa_error(WSAEOPNOTSUPP);
+        return WSAEOPNOTSUPP;
+    };
+    host(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
 }
@@ -948,6 +971,74 @@ mod tests {
         });
     }
 
+    /// A loopback list and `localhost` go to the host's `WSAConnectByList`
+    /// and `GetAddrInfoExA`; a host without them (Wine) fails the call with
+    /// `WSAEOPNOTSUPP` instead of aborting the title.
+    #[test]
+    fn a_loopback_list_connects_or_fails_cleanly() {
+        #[repr(C)]
+        struct List {
+            count: i32,
+            entries: [SocketAddress; 1],
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        let home = v4(HOME, port);
+        let list = List {
+            count: 1,
+            entries: [SocketAddress {
+                addr: home.as_ptr(),
+                len: 16,
+            }],
+        };
+        let null = std::ptr::null_mut::<c_void>();
+        let s = socket(2, 1, 6);
+        assert_ne!(s, INVALID_SOCKET);
+        let got = WSAConnectByList(
+            s,
+            (&raw const list).cast(),
+            null.cast(),
+            null,
+            null.cast(),
+            null,
+            std::ptr::null(),
+            null,
+        );
+        let error = last_error();
+        if crate::host::function("ws2_32.dll", "WSAConnectByList").is_some() {
+            assert_eq!(got, 1);
+            listener.accept().unwrap();
+        } else {
+            assert_eq!((got, error), (0, WSAEOPNOTSUPP));
+        }
+        close(s);
+
+        let mut result = std::ptr::dangling_mut::<c_void>();
+        let got = GetAddrInfoExA(
+            c"localhost".as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut result,
+            std::ptr::null(),
+            null,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        if crate::host::function("ws2_32.dll", "GetAddrInfoExA").is_some() {
+            assert_eq!(got, 0);
+            assert!(!result.is_null());
+            let free = host!("ws2_32.dll", "FreeAddrInfoEx": extern "system" fn(*mut c_void));
+            free(result);
+        } else {
+            assert_eq!((got, result), (WSAEOPNOTSUPP, std::ptr::null_mut()));
+        }
+    }
+
     #[test]
     fn only_loopback_is_reachable() {
         // Also starts Winsock for the raw calls below.
@@ -1106,6 +1197,7 @@ mod tests {
         // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
         // them only when the host really lacks them.
         const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        let mut missing = Vec::new();
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
@@ -1116,7 +1208,15 @@ mod tests {
             if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
                 continue;
             }
-            assert!(present, "{dll} lacks {}", e.name);
+            if !present {
+                missing.push(e.name);
+            }
         }
+        // Wine's ws2_32 has neither; the HLE fails them cleanly there.
+        const WINE_LACKS: &[&str] = &["WSAConnectByList", "GetAddrInfoExA"];
+        if crate::modules::xmem::on_wine() {
+            missing.retain(|name| !WINE_LACKS.contains(name));
+        }
+        assert!(missing.is_empty(), "the host lacks {missing:?}");
     }
 }

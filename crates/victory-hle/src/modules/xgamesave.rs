@@ -1112,6 +1112,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_kept_blob_past_the_link_limit_is_copied() {
+        // Wine's hard links are the host's (APFS on macOS), which has no
+        // 1024-link limit: the copy fallback cannot be reached there, and
+        // kept blobs stay hard-linked, which the other tests cover.
+        if crate::modules::xmem::on_wine() {
+            eprintln!("skipped: Wine's host filesystem has no 1024-link limit");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let links = tempfile::tempdir().unwrap();
         let root = dir.path();
