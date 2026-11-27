@@ -215,7 +215,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     // Checked again here: a cached translation from before the check came in
-    // (or from another host) can still ask for waves this host does not run.
+    // (an earlier build of the same translator version) can still ask for
+    // waves this host does not run.
     let host = victory_shader::emit::fits_host_wave(crate::shader_cache::host_shader(container)?)
         .map_err(|e| e.to_string())?;
     let stores = programs.is_empty() || programs.iter().any(stores);
