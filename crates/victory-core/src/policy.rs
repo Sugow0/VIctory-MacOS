@@ -184,10 +184,15 @@ mod tests {
             eprintln!("the tests do not run inside the repository; skipped");
             return;
         }
-        for path in ["no-such/x", "no-such/../x", "no-such/../../no-such"] {
+        // (out of the current directory and back into it by its name, so
+        // as deep in the repository as the tests run from)
+        let name = cwd.file_name().unwrap();
+        let back = Path::new("no-such").join("..").join("..").join(name).join("no-such");
+        for path in [Path::new("no-such/x"), Path::new("no-such/../x"), &back] {
             assert!(
-                matches!(ensure_outside_repo(Path::new(path)), Err(PolicyError::InsideRepo { .. })),
-                "{path}"
+                matches!(ensure_outside_repo(path), Err(PolicyError::InsideRepo { .. })),
+                "{}",
+                path.display()
             );
         }
     }
