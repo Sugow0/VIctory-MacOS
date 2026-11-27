@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: scripts/install-verify-agent.sh fills the @...@ fields and
+     installs it in ~/Library/LaunchAgents. Every StartInterval seconds (21600 here; the installer's hours option sets it) it runs
+     scripts/verify-agent-run.sh, which verifies origin/port-macos when it
+     has moved (docs/macos.md, "Verifying a merge"). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.victory.verify-macos</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@RUNNER@</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>21600</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XWIN_ACCEPT_LICENSE</key>
+        <string>@XWIN_ACCEPT_LICENSE@</string>
+        <key>VERIFY_STATE_DIR</key>
+        <string>@STATE@</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>@STATE@/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>@STATE@/agent.log</string>
+</dict>
+</plist>

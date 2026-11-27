@@ -305,3 +305,44 @@ wine64 target/x86_64-pc-windows-msvc/diag/victory.exe warm --used
 ```
 
 To pick an adapter, as on Windows: `--more VICTORY_D3D12_ADAPTER=<index or name>`.
+
+## Verifying a merge
+
+After upstream is merged into `port-macos`, one command checks a commit on
+this Mac: the workspace's tests natively (the toolchain `rust-toolchain.toml`
+pins, by rustup's path), the same tests cross-built with cargo-xwin and run
+under CrossOver's Wine (bottle `CX_BOTTLE`, default `victory`), one binary at
+a time with a timeout each, then `scripts/smoke-macos.sh`. It prints a table
+per test binary and the folder of its logs, and exits 0 only if every failure
+is in its allowlist (failures that come from the bottle: no git, no cargo
+inside Wine; listed by test name at the top of the script, with why).
+
+```sh
+XWIN_ACCEPT_LICENSE=1 scripts/verify-macos.sh                       # this checkout
+XWIN_ACCEPT_LICENSE=1 scripts/verify-macos.sh --ref origin/port-macos # any commit, in a temporary worktree
+scripts/verify-macos.sh --skip-wine --skip-smoke                    # native tests only
+```
+
+`XWIN_ACCEPT_LICENSE=1` accepts the Microsoft CRT and SDK license under which
+cargo-xwin downloads them; the script does not set it for you. Logs go to
+`~/Library/Logs/victory-verify/<date>-<sha>` (or `--log-dir`), build trees to
+`~/Library/Caches/victory-verify`. Exit status: 0 passed, 1 failed, 2 could not run.
+
+GitHub's runners have no CrossOver or D3DMetal, so the automatic check runs
+here, as a launchd agent: every few hours it fetches origin and, if
+`origin/port-macos` has moved since the commit verified last, verifies it with
+`--ref` and posts a macOS notification with the result. It posts nothing to
+GitHub. It runs the scripts of the checkout it was installed from, so install
+it from one that stays on `port-macos`:
+
+```sh
+XWIN_ACCEPT_LICENSE=1 scripts/install-verify-agent.sh install --hours 6
+scripts/install-verify-agent.sh status
+launchctl kickstart gui/$(id -u)/com.victory.verify-macos   # run it now
+scripts/install-verify-agent.sh uninstall
+```
+
+Its state is in `~/Library/Application Support/victory-verify`: `last` (the
+sha verified last; delete it to verify again), `last-result`, `agent.log` and
+`logs/`, one folder per run. `scripts/verify-agent-run.sh` is the job itself
+and can be run by hand (`--force` verifies even if nothing moved).
