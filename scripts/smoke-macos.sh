@@ -5,11 +5,13 @@
 # exited with 0 and that the frame meter logged frame times; prints their
 # median. No game data. (apps/victory/tests/smoke_title.rs is the same check
 # on Windows.)
-#   scripts/smoke-macos.sh [--frames N] [--unpaced] [--clears N] [--copies N] [--env VICTORY_X=V]... [--exit-code C] [--build release|diag] [--no-build] [--timeout S]
+#   scripts/smoke-macos.sh [--frames N] [--unpaced] [--clears N] [--copies N] [--draws N] [--env VICTORY_X=V]... [--exit-code C] [--build release|diag] [--no-build] [--timeout S]
 # --frames N      frames the title presents (default 1200: 20 s at its 60 Hz; 3600 unpaced; the meter logs every 5 s)
 # --unpaced       no frame clock (VICTORY_FRAME_INTERVAL_MS=0): as fast as presents go (vsync: 120 Hz on a ProMotion Mac)
 # --clears N      a load: N more clears of the target per frame (default 0)
 # --copies N      a load: N copies of the target per frame, each between two barriers (default 0)
+# --draws N       a load: N draws of a small triangle per frame, console shaders the fixture's build makes (default 0);
+#                 the check then also wants draws on the host (the meter's draws/frame above 0 on every line)
 #                 (the loads need a title built from this script's fixture: --no-build with an older one runs without)
 # --env K=V       a VIctory switch for the run (K starts with VICTORY_; repeatable; e.g. VICTORY_GPU_TIMING=1 with --build diag)
 # --exit-code C   the title returns C (non-zero: the check must fail)
@@ -25,7 +27,7 @@ set -euo pipefail
 # Decimal points in the numbers read and printed, whatever the locale.
 export LC_ALL=C
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "smoke-macos: $*" >&2; exit 1; }
 
 frames=
@@ -33,6 +35,7 @@ unpaced=0
 exit_code=0
 clears=0
 copies=0
+draws=0
 switches=()
 build=release
 do_build=1
@@ -43,6 +46,7 @@ while [ $# -gt 0 ]; do
         --unpaced) unpaced=1; shift ;;
         --clears) [ $# -ge 2 ] || die "--clears needs a number"; clears=$2; shift 2 ;;
         --copies) [ $# -ge 2 ] || die "--copies needs a number"; copies=$2; shift 2 ;;
+        --draws) [ $# -ge 2 ] || die "--draws needs a number"; draws=$2; shift 2 ;;
         --env)
             [ $# -ge 2 ] || die "--env needs VICTORY_X=V"
             case "$2" in VICTORY_*=*) ;; *) die "--env takes VICTORY_X=V, not '$2'" ;; esac
@@ -60,8 +64,9 @@ case "$frames" in ''|*[!0-9]*) die "--frames takes a whole number" ;; esac
 case "$exit_code" in ''|*[!0-9]*) die "--exit-code takes a whole number" ;; esac
 case "$clears" in ''|*[!0-9]*) die "--clears takes a whole number" ;; esac
 case "$copies" in ''|*[!0-9]*) die "--copies takes a whole number" ;; esac
+case "$draws" in ''|*[!0-9]*) die "--draws takes a whole number" ;; esac
 # As numbers (a leading 0 is not octal): 00 is no load.
-clears=$((10#$clears)); copies=$((10#$copies))
+clears=$((10#$clears)); copies=$((10#$copies)); draws=$((10#$draws))
 case "$timeout" in ''|*[!0-9]*) die "--timeout takes a whole number" ;; esac
 case "$build" in
     release) build_args=(--locked --release -p victory); profile=release ;;
@@ -132,8 +137,9 @@ env_args=(VICTORY_LOG=info VICTORY_CACHE_DIR="$(windows_path "$work/cache")" VIC
 [ "$unpaced" = 1 ] && env_args+=(VICTORY_FRAME_INTERVAL_MS=0)
 env_args+=(${switches[@]+"${switches[@]}"})
 title_args=("$frames" "$exit_code")
-[ "$clears" = 0 ] && [ "$copies" = 0 ] || title_args+=("$clears" "$copies")
-echo "smoke-macos: $frames frames$([ "$unpaced" = 1 ] && echo ', unpaced')$([ "$clears" = 0 ] || echo ", $clears more clears a frame")$([ "$copies" = 0 ] || echo ", $copies copies a frame"), $where, log $log"
+[ "$clears" = 0 ] && [ "$copies" = 0 ] && [ "$draws" = 0 ] || title_args+=("$clears" "$copies")
+[ "$draws" = 0 ] || title_args+=("$draws")
+echo "smoke-macos: $frames frames$([ "$unpaced" = 1 ] && echo ', unpaced')$([ "$clears" = 0 ] || echo ", $clears more clears a frame")$([ "$copies" = 0 ] || echo ", $copies copies a frame")$([ "$draws" = 0 ] || echo ", $draws draws a frame"), $where, log $log"
 started=$(date +%s)
 env "${env_args[@]}" "$wine" ${wine_args[@]+"${wine_args[@]}"} "$victory" run "$(windows_path "$work/smoke-title.exe")" --execute -- "${title_args[@]}" >"$log" 2>&1 &
 pid=$!
@@ -167,5 +173,18 @@ done
 times="$(sed -n 's/.* fps, \([0-9.]*\) ms\/frame (.*/\1/p' "$clean")"
 [ -n "$times" ] || fail "no \"ms/frame\" line from the frame meter"
 count=$(printf '%s\n' "$times" | wc -l | tr -d ' ')
-median=$(printf '%s\n' "$times" | sort -n | awk '{ v[NR] = $1 } END { if (NR % 2) print v[(NR + 1) / 2]; else printf "%.2f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2 }')
-echo "smoke-macos: PASSED in ${elapsed}s: title exited with 0, $count meter lines ($(printf '%s ' $times)ms/frame), median $median ms/frame"
+median_of() { sort -n | awk '{ v[NR] = $1 } END { if (NR % 2) print v[(NR + 1) / 2]; else printf "%.2f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2 }'; }
+median=$(printf '%s\n' "$times" | median_of)
+# Each meter line's draws run on the host per frame, and its split of the
+# frame: CPU preparing the submissions, waiting for the GPU.
+per_frame="$(sed -n 's/.* \([0-9][0-9]*\) draws\/frame, dropped .*/\1/p' "$clean")"
+preparing="$(sed -n 's/.* ms\/frame (\([0-9.]*\) preparing: .*/\1/p' "$clean")"
+on_gpu="$(sed -n 's/.*; \([0-9.]*\) on the GPU; .*/\1/p' "$clean")"
+if [ "$draws" != 0 ]; then
+    [ -n "$per_frame" ] || fail "no \"draws/frame\" in the frame meter's lines"
+    ! printf '%s\n' "$per_frame" | grep -qx 0 || fail "a meter line with 0 draws/frame ($(printf '%s ' $per_frame)): the draws did not reach the host"
+fi
+split=
+[ -z "$preparing" ] || split=", median $(printf '%s\n' "$preparing" | median_of) ms preparing, $(printf '%s\n' "$on_gpu" | median_of) ms on the GPU"
+[ -z "$per_frame" ] || split="$split, median $(printf '%s\n' "$per_frame" | median_of) draws/frame"
+echo "smoke-macos: PASSED in ${elapsed}s: title exited with 0, $count meter lines ($(printf '%s ' $times)ms/frame), median $median ms/frame$split"
