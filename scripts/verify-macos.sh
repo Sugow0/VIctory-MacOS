@@ -18,6 +18,9 @@
 # Written for macOS's own /bin/bash (3.2): no associative arrays, no mapfile.
 set -euo pipefail
 export LC_ALL=C
+# A command that fails unexpectedly (set -e) means the run could not be made,
+# not that a test failed: exit 2, which the agent retries.
+trap 'echo "verify-macos: aborted at line $LINENO" >&2; exit 2' ERR
 
 # Failures under Wine that come from the bottle, not from the code, as
 # "<package> <binary> <test name>" (exact). Anything else fails the run.
@@ -66,13 +69,48 @@ fi
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo="$(git -C "$script_dir" rev-parse --show-toplevel)"
 worktree=''
+pid=''
+lock=''
 cleanup() {
+    # The test binary running under Wine, if any, before its worktree goes.
+    if [ -n "$pid" ]; then kill_run "$pid" "${exe:-}"; fi
+    if [ -n "$lock" ]; then rm -rf "$lock"; fi
     if [ -n "$worktree" ]; then
         git -C "$repo" worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf "$worktree"
         git -C "$repo" worktree prune >/dev/null 2>&1 || true
     fi
 }
 trap cleanup EXIT
+trap 'exit 2' INT TERM HUP
+# TERM, then KILL if still there after 10 s; and the Windows process by its
+# path (unique: cargo's hash), matched literally.
+kill_run() {
+    local p=$1 path=$2 i=0 re
+    kill "$p" 2>/dev/null || true
+    re=''
+    [ -z "$path" ] || re="$(printf '%s' "$path" | sed 's/[][\\.*^$()+?{}|]/\\&/g')"
+    [ -z "$re" ] || pkill -f -- "$re" 2>/dev/null || true
+    while kill -0 "$p" 2>/dev/null && [ $i -lt 10 ]; do sleep 1; i=$((i + 1)); done
+    kill -9 "$p" 2>/dev/null || true
+    [ -z "$re" ] || pkill -9 -f -- "$re" 2>/dev/null || true
+}
+# One run at a time on this Mac: runs share the bottle and the build trees.
+# A lock whose owner is gone (reboot, kill -9) is taken over.
+take_lock() {
+    local d=$1 owner
+    if mkdir "$d" 2>/dev/null; then echo $$ >"$d/pid"; return 0; fi
+    owner="$(cat "$d/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then return 1; fi
+    # No pid yet: its owner may be writing it.
+    if [ -z "$owner" ] && [ -z "$(find "$d" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then return 1; fi
+    rm -rf "$d"
+    mkdir "$d" 2>/dev/null || return 1
+    echo $$ >"$d/pid"
+}
+cache="${VERIFY_CACHE_DIR:-$HOME/Library/Caches/victory-verify}"
+mkdir -p "$cache"
+take_lock "$cache/lock" || die "another verify-macos run holds $cache/lock (pid $(cat "$cache/lock/pid" 2>/dev/null || echo '?'))"
+lock="$cache/lock"
 if [ -n "$ref" ]; then
     sha="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")" || die "no commit '$ref'"
     worktree="$(mktemp -d "${TMPDIR:-/tmp}/victory-verify.XXXXXX")"
@@ -89,8 +127,6 @@ dirty=''
 [ -n "$log_dir" ] || log_dir="$HOME/Library/Logs/victory-verify/$(date +%Y%m%d-%H%M%S)-$short"
 mkdir -p "$log_dir"
 log_dir="$(cd "$log_dir" && pwd)"
-cache="${VERIFY_CACHE_DIR:-$HOME/Library/Caches/victory-verify}"
-mkdir -p "$cache"
 rows="$log_dir/rows.tsv"
 : >"$rows"
 say "verifying $short$dirty in $src"
@@ -104,7 +140,10 @@ is_allowed() {
 
 # The toolchain rust-toolchain.toml pins, by rustup's path: Homebrew's cargo,
 # often first on PATH, ignores the file.
-channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$src/rust-toolchain.toml" 2>/dev/null | head -n 1)"
+channel=''
+if [ -f "$src/rust-toolchain.toml" ]; then
+    channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$src/rust-toolchain.toml" | head -n 1)"
+fi
 [ -n "$channel" ] || channel=stable
 host="$( [ "$(uname -m)" = arm64 ] && echo aarch64 || echo x86_64 )-apple-darwin"
 
@@ -141,7 +180,9 @@ if [ "$do_native" = 1 ]; then
         }
         END { flush() }
     ' "$log_dir/native.log"
-    if [ "$status" != 0 ] && ! grep -q "	FAILED\|	CRASHED" "$rows"; then
+    if ! grep -q "^native	" "$rows"; then
+        row native "cargo test" - - - "FAILED: exit $status, no test binary found in native.log"
+    elif [ "$status" != 0 ] && ! grep -q "	FAILED\|	CRASHED" "$rows"; then
         row native "cargo test (build)" - - - "FAILED: cargo exited $status before any test failed, see native.log"
     fi
 fi
@@ -180,9 +221,15 @@ for line in open(sys.argv[1], encoding="utf-8"):
         continue
     pkg = m["package_id"]
     # "path+file:///.../crates/victory-pe#0.1.0" or "victory-pe 0.1.0 (path+...)"
-    name = pkg.split()[0] if " " in pkg else pkg.rsplit("/", 1)[-1].split("#")[0].split("@")[0]
+    # or "path+file:///.../dir#name@0.1.0" (a package named unlike its folder)
+    if " " in pkg:
+        name = pkg.split()[0]
+    else:
+        tail = pkg.rsplit("/", 1)[-1]
+        frag = tail.split("#", 1)[1] if "#" in tail else tail
+        name = frag.split("@")[0] if "@" in frag else tail.split("#")[0]
     print("\t".join([name, m["target"]["name"], os.path.dirname(m["manifest_path"]), m["executable"]]))
-' "$log_dir/xwin-build.json" >"$log_dir/xwin-exes.tsv"
+' "$log_dir/xwin-build.json" >"$log_dir/xwin-exes.tsv" || die "could not read the build's JSON (see xwin-build.json)"
         [ -s "$log_dir/xwin-exes.tsv" ] || row wine "cargo xwin test --no-run" - - - "FAILED: no test executables in the build's output"
         export ROSETTA_ADVERTISE_AVX="${ROSETTA_ADVERTISE_AVX:-1}"
         say "wine: $(wc -l <"$log_dir/xwin-exes.tsv" | tr -d ' ') test binaries, bottle $bottle, ${timeout}s each"
@@ -199,15 +246,14 @@ for line in open(sys.argv[1], encoding="utf-8"):
             while kill -0 "$pid" 2>/dev/null; do
                 if [ $(( $(date +%s) - started )) -ge "$timeout" ]; then
                     timed_out=1
-                    kill "$pid" 2>/dev/null || true
-                    # The Windows process itself: its path is unique (cargo's hash).
-                    pkill -f "$exe" 2>/dev/null || true
+                    kill_run "$pid" "$exe"
                     break
                 fi
                 sleep 1
             done
             st=0
             wait "$pid" 2>/dev/null || st=$?
+            pid=''
             tr -d '\r' <"$out.out" >"$out.txt"
             result="$(grep '^test result:' "$out.txt" | tail -n 1 || true)"
             num() { printf '%s\n' "$result" | sed -n "s/.* \([0-9][0-9]*\) $1.*/\1/p"; }
