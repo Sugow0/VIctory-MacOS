@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Template: scripts/install-verify-agent.sh fills the @...@ fields and
-     installs it in ~/Library/LaunchAgents. Every StartInterval seconds (21600 here, --hours sets it) it runs
+     installs it in ~/Library/LaunchAgents. Every StartInterval seconds (21600 here; the installer's hours option sets it) it runs
      scripts/verify-agent-run.sh, which verifies origin/port-macos when it
      has moved (docs/macos.md, "Verifying a merge"). -->
 <plist version="1.0">

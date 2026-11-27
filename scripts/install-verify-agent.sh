@@ -47,7 +47,10 @@ open(dst, "w", encoding="utf-8").write(t)
 ' "$script_dir/launchd/$label.plist" "$plist" "$runner" "$((hours * 3600))" "$state"
         plutil -lint "$plist" >/dev/null || die "the plist written is not valid: $plist"
         launchctl bootout "$domain/$label" 2>/dev/null || true
-        launchctl bootstrap "$domain" "$plist"
+        # bootout returns before the job is gone: bootstrap can fail (5: I/O error) until it is.
+        i=0
+        while launchctl print "$domain/$label" >/dev/null 2>&1 && [ $i -lt 10 ]; do sleep 1; i=$((i + 1)); done
+        launchctl bootstrap "$domain" "$plist" 2>/dev/null || { sleep 2; launchctl bootstrap "$domain" "$plist"; }
         echo "installed: $plist, every ${hours}h, runs $runner"
         echo "log: $state/agent.log; run now: launchctl kickstart $domain/$label"
         ;;

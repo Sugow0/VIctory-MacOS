@@ -17,10 +17,8 @@ case "${1:-}" in --force) force=1 ;; '') ;; *) echo "usage: $0 [--force]" >&2; e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
-repo="$(git -C "$script_dir" rev-parse --show-toplevel)" || exit 2
 state="${VERIFY_STATE_DIR:-$HOME/Library/Application Support/victory-verify}"
 branch="${VERIFY_BRANCH:-port-macos}"
-mkdir -p "$state/logs" || exit 2
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 notify() {
     # $1 title, $2 message; quotes cannot break out of the AppleScript strings.
@@ -28,20 +26,36 @@ notify() {
     t=$(printf '%s' "$1" | tr -d '"\\'); m=$(printf '%s' "$2" | tr -d '"\\')
     osascript -e "display notification \"$m\" with title \"$t\"" >/dev/null 2>&1 || true
 }
+repo="$(git -C "$script_dir" rev-parse --show-toplevel)" || { notify "VIctory verify: could not run" "$script_dir is not in a git checkout"; exit 2; }
+mkdir -p "$state/logs" || { notify "VIctory verify: could not run" "cannot write $state"; exit 2; }
 
-# One run at a time (a run by hand and the agent's).
+# Could not run: said in the log and in a notification, so that a fetch that
+# keeps failing (no ssh key under launchd...) does not go unseen.
+cannot() {
+    echo "$(stamp) $*"
+    notify "VIctory verify: could not run" "$*. Log: $state/agent.log"
+    exit 2
+}
+
+# One run at a time (a run by hand and the agent's). A lock whose owner is
+# gone (reboot, kill -9) is taken over.
 lock="$state/lock"
 if ! mkdir "$lock" 2>/dev/null; then
-    echo "$(stamp) another run holds $lock; nothing done"
-    exit 0
+    owner="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+        echo "$(stamp) run $owner holds $lock; nothing done"
+        exit 0
+    fi
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || { echo "$(stamp) $lock taken meanwhile; nothing done"; exit 0; }
 fi
-trap 'rmdir "$lock" 2>/dev/null' EXIT
+echo $$ >"$lock/pid"
+trap 'rm -rf "$lock"' EXIT
+trap 'exit 2' INT TERM HUP
 
-if ! git -C "$repo" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch"; then
-    echo "$(stamp) git fetch origin failed"
-    exit 2
-fi
-sha="$(git -C "$repo" rev-parse --verify --quiet "origin/$branch^{commit}")" || { echo "$(stamp) no origin/$branch"; exit 2; }
+git -C "$repo" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" \
+    || cannot "git fetch origin failed (from $repo)"
+sha="$(git -C "$repo" rev-parse --verify --quiet "origin/$branch^{commit}")" || cannot "no origin/$branch"
 last="$(cat "$state/last" 2>/dev/null || true)"
 if [ "$force" = 0 ] && [ "$sha" = "$last" ]; then
     echo "$(stamp) origin/$branch is still ${sha:0:10}, verified last; nothing to do"
