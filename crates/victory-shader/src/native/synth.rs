@@ -150,7 +150,7 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// The literal operand (the next dword).
 const LITERAL: u32 = 255;
 
-/// VOP1 `<op> v<dst>, <src>` (`src` 256 + n is v<n>).
+/// VOP1 `<op> v<dst>, <src>` (`src` 256 + n is `v<n>`).
 const fn vop1(op: u32, dst: u32, src: u32) -> u32 {
     0x7E00_0000 | dst << 17 | op << 9 | src
 }

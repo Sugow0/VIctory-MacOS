@@ -12,7 +12,8 @@
 # --copies N      a load: N copies of the target per frame, each between two barriers (default 0)
 # --draws N       a load: N draws of a small triangle per frame, console shaders the fixture's build makes (default 0);
 #                 the check then also wants draws on the host (the meter's draws/frame above 0 on every line)
-#                 (the loads need a title built from this script's fixture: --no-build with an older one runs without)
+#                 (the loads need a title built from this script's fixture: --no-build with an older one runs
+#                 without them, so --draws then fails its check)
 # --env K=V       a VIctory switch for the run (K starts with VICTORY_; repeatable; e.g. VICTORY_GPU_TIMING=1 with --build diag)
 # --exit-code C   the title returns C (non-zero: the check must fail)
 # --build B       release (the default) or diag (diagnostics, as play-macos.sh plays)
@@ -27,7 +28,7 @@ set -euo pipefail
 # Decimal points in the numbers read and printed, whatever the locale.
 export LC_ALL=C
 
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "smoke-macos: $*" >&2; exit 1; }
 
 frames=
