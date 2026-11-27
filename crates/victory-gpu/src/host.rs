@@ -10539,6 +10539,8 @@ mod refresh_tests {
             ) as usize;
             assert_ne!(at, 0);
             let len = blocks * PAGE;
+            // As the runtime tells of it.
+            crate::title_placeholder_reserved(at, len);
             let section =
                 CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null());
             for block in (0..blocks).filter(|b| b % 4 != 3) {

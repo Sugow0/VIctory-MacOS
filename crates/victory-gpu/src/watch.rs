@@ -2032,8 +2032,20 @@ fn known_holes() -> bool {
 
 /// Whether `block` lies in a placeholder: a reservation in which pages come
 /// to be only by mapping a view (or an allocation) in its place, which an
-/// ordinary commit cannot do.
+/// ordinary commit cannot do. Where the host cannot tell
+/// ([`host_tells_placeholders`]), the runtime's record of its placeholders
+/// does ([`recorded_placeholder`]).
 fn placeholder(block: usize) -> bool {
+    if !host_tells_placeholders() {
+        return recorded_placeholder(block);
+    }
+    const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
+    region_type(block * BLOCK).is_ok_and(|kind| kind & PLACEHOLDER_RESERVATION != 0)
+}
+
+/// The region flags (`MEMORY_REGION_INFORMATION`'s `RegionType`) of the
+/// memory at `at`, or the status the host refused the question with.
+fn region_type(at: usize) -> Result<u32, i32> {
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]
@@ -2059,25 +2071,140 @@ fn placeholder(block: usize) -> bool {
     }
     // (Class 3 answers with the kind of memory in that word, not the flags.)
     const MEMORY_REGION_INFORMATION_EX: u32 = 7;
-    const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
     let mut region = Region::default();
     // SAFETY: the answer's room and its size.
     let status = unsafe {
         NtQueryVirtualMemory(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            (block * BLOCK) as *const _,
+            at as *const _,
             MEMORY_REGION_INFORMATION_EX,
             (&raw mut region).cast(),
             size_of::<Region>(),
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    if status >= 0 { Ok(region.region_type) } else { Err(status) }
+}
+
+/// Whether the host tells a placeholder from a plain reservation (asked
+/// once). Wine does not: it has no class 7 (`STATUS_INVALID_INFO_CLASS`),
+/// its class 3 says no region flags, and `VirtualQuery` shows a placeholder
+/// as any reservation. Without the runtime's record no hole would be known
+/// there, and every asking about a range with holes would put a question to
+/// the host for each of them (as `VICTORY_KNOWN_HOLES=0`).
+fn host_tells_placeholders() -> bool {
+    const STATUS_INVALID_INFO_CLASS: i32 = 0xc000_0003_u32 as i32;
+    static TELLS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // (Asked of this function's own page, which is there.)
+    *TELLS.get_or_init(|| region_type(host_tells_placeholders as *const () as usize) != Err(STATUS_INVALID_INFO_CLASS))
+}
+
+/// The runtime's placeholders where the host cannot tell them
+/// ([`host_tells_placeholders`]; in tests always, to check the record on any
+/// host): each reservation made as one, start to end (bytes), kept whole
+/// whatever it is split into or mapped over, since [`recorded_placeholder`]
+/// asks the host whether a block is a reservation still. Allocations and
+/// frees there take their range out of it. Few entries (the title's pools),
+/// written at its reservations and frees only, read when a block is first
+/// found absent; no other lock is taken under this one.
+static PLACEHOLDERS: std::sync::RwLock<std::collections::BTreeMap<usize, usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// Whether [`PLACEHOLDERS`] is kept.
+fn recording() -> bool {
+    cfg!(test) || !host_tells_placeholders()
+}
+
+/// Whether `block` lies in one of the runtime's placeholders by its record
+/// and is a reservation (no view, no allocation in its place).
+fn recorded_placeholder(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let at = block * BLOCK;
+    let recorded = PLACEHOLDERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=at)
+        .next_back()
+        .is_some_and(|(_, &end)| end > at);
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    recorded
+        && unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } != 0
+        && info.State == MEM_RESERVE
+}
+
+/// The runtime reserved `[at, at + len)` as a placeholder (to be split and
+/// mapped into): recorded where the host cannot tell ([`PLACEHOLDERS`]).
+pub fn title_placeholder_reserved(at: usize, len: usize) {
+    if len == 0 || !recording() {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut record = PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner());
+    forget_in(&mut record, at, end);
+    record.insert(at, end);
+}
+
+/// `[at, end)` is no placeholder of the runtime's any more (or may not be).
+fn forget_placeholders(at: usize, end: usize) {
+    if at >= end || !recording() {
+        return;
+    }
+    let overlaps = |record: &std::collections::BTreeMap<usize, usize>| {
+        record.range(..end).next_back().is_some_and(|(_, &to)| to > at)
+    };
+    if !overlaps(&PLACEHOLDERS.read().unwrap_or_else(|e| e.into_inner())) {
+        return;
+    }
+    forget_in(&mut PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner()), at, end);
+}
+
+/// Takes `[at, end)` out of the record, keeping what lies on either side.
+fn forget_in(record: &mut std::collections::BTreeMap<usize, usize>, at: usize, end: usize) {
+    // (Entries do not overlap: by start they are by end too.)
+    let hit: Vec<(usize, usize)> =
+        record.range(..end).rev().take_while(|&(_, &to)| to > at).map(|(&from, &to)| (from, to)).collect();
+    for (from, to) in hit {
+        record.remove(&from);
+        if from < at {
+            record.insert(from, at);
+        }
+        if to > end {
+            record.insert(end, to);
+        }
+    }
+}
+
+/// The title frees `[at, at + len)`, or with no length the allocation at
+/// `at`: no placeholder of the runtime's there any more.
+fn placeholders_freed(at: usize, len: usize) {
+    if !recording() {
+        return;
+    }
+    if len != 0 {
+        forget_placeholders(at, at.saturating_add(len));
+        return;
+    }
+    // The placeholder piece at `at`; where the host does not say how far it
+    // goes, all of the reservation from `at` on.
+    let to = PLACEHOLDERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=at)
+        .next_back()
+        .and_then(|(_, &to)| (to > at).then_some(to));
+    let Some(to) = to else {
+        return;
+    };
+    let end = allocation_end(at, at);
+    forget_placeholders(at, if end > at { end.min(to) } else { to });
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    forget_placeholders(at, at.saturating_add(len));
     if len == 0 || !known_holes() {
         return;
     }
@@ -3657,6 +3784,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    placeholders_freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
@@ -4058,7 +4186,8 @@ mod tests {
         };
     }
 
-    /// A placeholder of `blocks` blocks, each its own.
+    /// A placeholder of `blocks` blocks, each its own, told of as the runtime
+    /// does.
     fn placeholder(blocks: usize) -> usize {
         use windows_sys::Win32::System::Memory::{
             MEM_PRESERVE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, VirtualAlloc2,
@@ -4076,6 +4205,7 @@ mod tests {
                 0,
             ) as usize;
             assert_ne!(p, 0);
+            title_placeholder_reserved(p, blocks * BLOCK);
             for block in 0..blocks - 1 {
                 assert_ne!(
                     VirtualFree((p + block * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
@@ -4084,6 +4214,14 @@ mod tests {
             }
             p
         }
+    }
+
+    /// Frees the allocation at `at` as the title's `VirtualFree` does: told
+    /// of first.
+    fn release(at: usize) {
+        title_memory_freed(at, 0);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
     /// Private memory of `protect` in place of the placeholder of one block.
@@ -4197,12 +4335,7 @@ mod tests {
         title_memory_freed(p, BLOCK);
         assert!(!known(0) && !guards().held.contains(p / BLOCK));
         title_memory_unmapping(p, 3 * BLOCK);
-        // SAFETY: our placeholders.
-        unsafe {
-            for block in 0..3 {
-                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
-            }
-        }
+        (0..3).for_each(|block| release(p + block * BLOCK));
     }
 
     /// A refresh during a change of mapping guards nothing the runtime has
@@ -4289,11 +4422,79 @@ mod tests {
         writing(p, BLOCK);
         as_made();
         title_memory_unmapping(p, 3 * BLOCK);
-        // SAFETY: our allocations.
+        (0..3).for_each(|block| release(p + block * BLOCK));
+    }
+
+    /// The runtime's record of its placeholders, which answers where the
+    /// host cannot tell one (Wine): a block of one is a hole while nothing
+    /// is in its place, until the runtime tells of an allocation there or
+    /// a free; a placeholder it was not told of, or a plain reservation, is
+    /// none by it.
+    #[test]
+    fn placeholders_are_known_by_the_runtimes_record() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER,
+            MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let p = placeholder(3);
+        let first = p / BLOCK;
+        // SAFETY: a placeholder nobody is told of, and a plain reservation.
+        let (untold, plain) = unsafe {
+            let untold = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            (untold, VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_NOACCESS) as usize)
+        };
+        assert!(untold != 0 && plain != 0);
+        assert!((0..3).all(|block| recorded_placeholder(first + block)), "told of");
+        assert!(!recorded_placeholder(untold / BLOCK), "the record answers, not the host");
+        assert!(!recorded_placeholder(plain / BLOCK));
+        if host_tells_placeholders() {
+            // (Both agree where the host tells.)
+            assert!(super::placeholder(first) && super::placeholder(untold / BLOCK) && !super::placeholder(plain / BLOCK));
+        } else {
+            assert!(super::placeholder(first) && !super::placeholder(untold / BLOCK), "the record, where the host cannot tell");
+        }
+        // A view in the first block's place: no hole while it is there.
+        // SAFETY: a section's block over our placeholder, unmapped again.
         unsafe {
-            for block in 0..3 {
-                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
-            }
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                p as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(view.Value as usize, p);
+            assert!(!recorded_placeholder(first), "a view");
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
+        }
+        assert!(recorded_placeholder(first), "a placeholder again");
+        // An allocation the runtime tells of; a free by allocation.
+        private_at(p + BLOCK, PAGE_READWRITE);
+        title_memory_allocated(p + BLOCK, BLOCK);
+        title_memory_freed(p + 2 * BLOCK, 0);
+        assert!(recorded_placeholder(first) && !recorded_placeholder(first + 1) && !recorded_placeholder(first + 2));
+        (0..3).for_each(|block| release(p + block * BLOCK));
+        assert!(!recorded_placeholder(first));
+        // SAFETY: our reservations.
+        unsafe {
+            VirtualFree(untold as *mut _, 0, MEM_RELEASE);
+            VirtualFree(plain as *mut _, 0, MEM_RELEASE);
         }
     }
 
@@ -5461,6 +5662,7 @@ mod many_askers_tests {
                 std::ptr::null_mut(),
                 0,
             ) as usize;
+            super::title_placeholder_reserved(at, BLOCKS * PAGE);
             let section =
                 CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (BLOCKS * PAGE) as u32, std::ptr::null());
             (at, section)
@@ -5547,6 +5749,7 @@ mod many_askers_tests {
                 std::ptr::null_mut(),
                 0,
             ) as usize;
+            super::title_placeholder_reserved(at, BLOCKS * PAGE);
             for block in 0..BLOCKS - 1 {
                 VirtualFree((at + block * PAGE) as *mut _, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
             }
