@@ -13,7 +13,8 @@
 # Environment: XWIN_ACCEPT_LICENSE=1 (required for the Windows builds: you
 # accept the Microsoft CRT/SDK license cargo-xwin downloads), CX_BOTTLE
 # (default victory), WINE (default CrossOver's), VERIFY_CACHE_DIR (cargo
-# target dirs kept between runs; default ~/Library/Caches/victory-verify).
+# target dirs kept between runs, one set per checkout and one for --ref;
+# default ~/Library/Caches/victory-verify).
 # Exit status: 0 passed, 1 a test or stage failed, 2 could not run.
 # Written for macOS's own /bin/bash (3.2): no associative arrays, no mapfile.
 set -Eeuo pipefail
@@ -38,7 +39,7 @@ victory-loader load_probe loads_binds_and_calls_probe
 victory smoke_title end_to_end::a_synthetic_title_presents_frames_and_exits_0
 '
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "verify-macos: $*" >&2; exit 2; }
 say() { echo "verify-macos: $*"; }
 
@@ -114,12 +115,25 @@ take_lock "$cache/lock" || die "another verify-macos run holds $cache/lock (pid 
 lock="$cache/lock"
 if [ -n "$ref" ]; then
     sha="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")" || die "no commit '$ref'"
-    worktree="$(mktemp -d "${TMPDIR:-/tmp}/victory-verify.XXXXXX")"
+    # Always the same folder (under the lock), so that its builds are
+    # incremental and the paths compiled into them (env!("CARGO_MANIFEST_DIR"))
+    # stay valid; one left by a killed run is replaced.
+    wt="$cache/ref/src"
+    if [ -e "$wt" ]; then
+        git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+        git -C "$repo" worktree prune >/dev/null 2>&1 || true
+    fi
+    mkdir -p "$cache/ref"
+    worktree=$wt
     git -C "$repo" worktree add --detach --quiet "$worktree" "$sha" || die "git worktree add failed"
     src=$worktree
+    builds="$cache/ref"
 else
     src=$repo
     sha="$(git -C "$src" rev-parse HEAD)"
+    # Build trees of their own per checkout: a test binary has its checkout's
+    # paths compiled in, and cargo would reuse one built in another checkout.
+    builds="$cache/checkout-$(printf '%s' "$src" | shasum | cut -c1-12)"
 fi
 short=${sha:0:10}
 dirty=''
@@ -154,7 +168,7 @@ if [ "$do_native" = 1 ]; then
     [ -x "$T/cargo" ] || die "no toolchain $channel-$host in ~/.rustup (rustup toolchain install $channel)"
     say "native: cargo test --workspace --locked ($channel-$host)"
     status=0
-    ( cd "$src" && unset RUSTUP_TOOLCHAIN && PATH="$T:$PATH" RUSTC="$T/rustc" CARGO_TARGET_DIR="$cache/native" \
+    ( cd "$src" && unset RUSTUP_TOOLCHAIN && PATH="$T:$PATH" RUSTC="$T/rustc" CARGO_TARGET_DIR="$builds/native" \
         "$T/cargo" test --workspace --locked --no-fail-fast ) >"$log_dir/native.log" 2>&1 || status=$?
     # "Running <src> (<path>/deps/<crate>-<hash>)" or "Doc-tests <crate>",
     # then that binary's "test result:" and its "... FAILED" lines.
@@ -204,7 +218,7 @@ if [ "$do_wine" = 1 ]; then
     say "wine: cargo xwin test --no-run --target x86_64-pc-windows-msvc --workspace"
     status=0
     ( cd "$src" && unset RUSTC RUSTUP_TOOLCHAIN \
-        && PATH="$brew_prefix/opt/llvm/bin:$brew_prefix/opt/lld/bin:$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR="$cache/xwin" \
+        && PATH="$brew_prefix/opt/llvm/bin:$brew_prefix/opt/lld/bin:$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR="$builds/xwin" \
         cargo xwin test --no-run --locked --target x86_64-pc-windows-msvc --workspace --message-format=json \
     ) >"$log_dir/xwin-build.json" 2>"$log_dir/xwin-build.log" || status=$?
     if [ "$status" != 0 ]; then
@@ -294,7 +308,7 @@ if [ "$do_smoke" = 1 ]; then
         row smoke smoke-macos.sh - - - "FAILED: no scripts/smoke-macos.sh in $short"
     else
         status=0
-        CARGO_TARGET_DIR="$cache/smoke" "$src/scripts/smoke-macos.sh" >"$log_dir/smoke.log" 2>&1 </dev/null || status=$?
+        CARGO_TARGET_DIR="$builds/smoke" "$src/scripts/smoke-macos.sh" >"$log_dir/smoke.log" 2>&1 </dev/null || status=$?
         if [ "$status" = 0 ]; then
             row smoke smoke-macos.sh 1 0 0 "ok: $(sed -n 's/^smoke-macos: PASSED in //p' "$log_dir/smoke.log" | tail -n 1)"
         else
