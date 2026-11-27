@@ -1231,16 +1231,26 @@ pub extern "system" fn XMemMapPhysicalPages(
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
-        // One view per run of consecutive slices of one section.
-        let run = 1 + slices[i + 1..]
-            .iter()
-            .zip(1..)
-            .take_while(|&(slice, k)| {
-                slice.as_ref().is_some_and(|s| {
-                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
+        // One view per run of consecutive slices of one section; under
+        // Wine one per page. A view cut up later is unmapped whole and the
+        // rest mapped again (`unmap`), and Wine's map call shows, for a
+        // moment, memory that reads and takes writes in place of the
+        // section's (zeros, or a copy), not a fault a title thread waits
+        // out (`victory_gpu::title_memory_remapping`): what it wrote then
+        // is lost. Views of one page are never cut up.
+        let run = if on_wine() {
+            1
+        } else {
+            1 + slices[i + 1..]
+                .iter()
+                .zip(1..)
+                .take_while(|&(slice, k)| {
+                    slice.as_ref().is_some_and(|s| {
+                        Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
+                    })
                 })
-            })
-            .count();
+                .count()
+        };
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
             return std::ptr::null_mut();
         }
@@ -2472,9 +2482,20 @@ mod tests {
             assert!(map_alias(at as u64, 0, 0));
         }
 
-        // The view is still the one view it was.
-        let view = physical().views.get(&(a as usize)).map(|v| v.0);
-        assert_eq!(view, Some(2 * PAGE));
+        // The view is still the one view it was (under Wine the two of a
+        // page each, `XMemMapPhysicalPages`).
+        let (a_at, second_at) = (a as usize, second as usize);
+        let views: Vec<(usize, usize)> = physical()
+            .views
+            .range(a_at..second_at + PAGE)
+            .map(|(at, v)| (*at, v.0))
+            .collect();
+        let want = if on_wine() {
+            vec![(a_at, PAGE), (second_at, PAGE)]
+        } else {
+            vec![(a_at, 2 * PAGE)]
+        };
+        assert_eq!(views, want);
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(query(second).host.State, MEM_COMMIT);
         // SAFETY: still mapped.
