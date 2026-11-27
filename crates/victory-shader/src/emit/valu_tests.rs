@@ -1014,6 +1014,17 @@ fn v_cvt_norm_i16_and_u16_f16_round_the_exact_product() {
     }
 }
 
+/// Whether `backend` gives NaN for the sine and cosine of NaN and of
+/// infinities: not D3DMetal's hardware device, which gives a number for NaN
+/// (docs/macos.md, known limits).
+fn nan_kept(backend: &str) -> bool {
+    let kept = backend != "hardware" || !super::host::on_d3dmetal();
+    if !kept {
+        eprintln!("{backend}: D3DMetal's sine or cosine of a non-finite input not checked");
+    }
+    kept
+}
+
 #[test]
 fn v_sin_and_v_cos_f32_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x035, 0, vgpr(1))]);
@@ -1045,7 +1056,7 @@ fn v_sin_and_v_cos_f32_reduce_large_turns() {
                 (got_f - want).abs(),
             ),
             None => assert!(
-                got_f.is_nan(),
+                !nan_kept(backend) || got_f.is_nan(),
                 "{backend}: v_sin_f32({}) = {got_f}, want NaN",
                 f32::from_bits(inp[0]),
             ),
@@ -1076,7 +1087,7 @@ fn v_sin_and_v_cos_f32_reduce_large_turns() {
                 (got_f - want).abs(),
             ),
             None => assert!(
-                got_f.is_nan(),
+                !nan_kept(backend) || got_f.is_nan(),
                 "{backend}: v_cos_f32({}) = {got_f}, want NaN",
                 f32::from_bits(inp[0]),
             ),
@@ -1282,7 +1293,7 @@ fn v_sin_and_v_cos_f16_reduce_large_turns() {
                 );
             }
             None => assert!(
-                is_f16_nan(got_h),
+                !nan_kept(backend) || is_f16_nan(got_h),
                 "{backend}: v_sin_f16({:#06x}) = {got_h:#06x}, want NaN",
                 inp[0],
             ),
@@ -1316,7 +1327,7 @@ fn v_sin_and_v_cos_f16_reduce_large_turns() {
                 );
             }
             None => assert!(
-                is_f16_nan(got_h),
+                !nan_kept(backend) || is_f16_nan(got_h),
                 "{backend}: v_cos_f16({:#06x}) = {got_h:#06x}, want NaN",
                 inp[0],
             ),
@@ -2104,6 +2115,10 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         let Ok(host) = Host::new(warp) else {
             continue;
         };
+        if !doubles(&host) {
+            eprintln!("{label}: no double-precision shader operations (D3D12_OPTIONS); skipped");
+            continue;
+        }
         let (root, pso) = match host.compute_pipeline(&shader) {
             Ok(p) => p,
             // WARP does not support fixed WaveSize(32) on SM 6.6.
@@ -2145,6 +2160,22 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }
     }
+}
+
+/// Whether the device runs double-precision shader operations
+/// (`DoublePrecisionFloatShaderOps`; D3DMetal's does not).
+fn doubles(host: &Host) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: a feature structure of the requested type and size.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok_and(|()| options.DoublePrecisionFloatShaderOps.as_bool())
 }
 
 /// Whether the hardware adapter is an AMD RDNA card's: what the translator

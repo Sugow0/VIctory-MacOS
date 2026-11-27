@@ -1761,6 +1761,11 @@ mod tests {
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
         // value; ours works with older ones too.)
+        if super::host::on_d3dmetal() {
+            // (D3DMetal does not check the hash: docs/macos.md)
+            eprintln!("D3DMetal does not check the container hash; that check skipped");
+            return;
+        }
         let mut wrong = ps.dxil[4..20].to_vec();
         wrong[0] ^= 1;
         for digest in [&[0u8; 16][..], &wrong] {
@@ -3078,6 +3083,12 @@ mod barycentric_tests {
             }
             if !options.BarycentricsSupported.as_bool() {
                 eprintln!("no barycentrics on {backend}; skipped");
+                continue;
+            }
+            if !warp && super::host::on_d3dmetal() {
+                // (it reports barycentrics, and SV_Barycentrics with an
+                // attribute per vertex gives 0: docs/macos.md)
+                eprintln!("D3DMetal's barycentric interpolation gives 0 on {backend}; skipped");
                 continue;
             }
             for paired in [false, true] {

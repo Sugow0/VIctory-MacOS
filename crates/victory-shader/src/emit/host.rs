@@ -67,6 +67,44 @@ fn software(desc: &DXGI_ADAPTER_DESC1) -> bool {
         || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
 }
 
+/// The adapter name D3DMetal (Apple's D3D12 on Metal, under Wine) gives
+/// every GPU it shows.
+const D3DMETAL_ADAPTER: &str = "AMD Compatibility Mode";
+
+/// Whether D3D12 here is D3DMetal: under Wine (ntdll exports
+/// `wine_get_version`) with an adapter named as D3DMetal names them.
+///
+/// For tests that check what the D3D12 runtime or driver does and D3DMetal
+/// does otherwise while reporting the capability (docs/macos.md, known
+/// limits). Behaviour a capability query decides is chosen by that query.
+pub fn on_d3dmetal() -> bool {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        // SAFETY: plain lookups in ntdll, always loaded, and adapter queries.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            let wine = !ntdll.is_null()
+                && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some();
+            if !wine {
+                return false;
+            }
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return false;
+            };
+            (0..)
+                .map_while(|i| factory.EnumAdapters1(i).ok())
+                .filter_map(|a| a.GetDesc1().ok())
+                .any(|d| {
+                    String::from_utf16_lossy(&d.Description).trim_end_matches('\0')
+                        == D3DMETAL_ADAPTER
+                })
+        }
+    })
+}
+
 /// The device's `WaveLaneCountMin..=WaveLaneCountMax`, if it answers.
 pub fn wave_lanes(device: &ID3D12Device) -> Option<std::ops::RangeInclusive<u32>> {
     let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();

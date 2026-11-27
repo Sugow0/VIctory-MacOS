@@ -259,6 +259,12 @@ fn a_counter_texture_is_set_by_a_store_of_one_channel() {
             View::RawUav(2),
         ];
         for (label, got) in run(&shader, &views) {
+            if label == "hardware" && super::host::on_d3dmetal() {
+                // (the texel keeps the stored 9: the thread's atomic add after
+                // its store is lost or done before it, docs/macos.md)
+                eprintln!("{label}: D3DMetal gives {}; not checked", got[0]);
+                continue;
+            }
             assert_eq!(got[0], 10, "{label}");
         }
     }
