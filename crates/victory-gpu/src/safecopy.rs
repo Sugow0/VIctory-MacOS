@@ -572,7 +572,7 @@ fn plain_stores() -> bool {
 }
 
 /// Whether we run under Wine: its ntdll exports `wine_get_version`.
-fn on_wine() -> bool {
+pub(crate) fn on_wine() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     // SAFETY: plain lookups in ntdll, always loaded.
     unsafe {
