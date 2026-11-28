@@ -110,6 +110,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(test)]
+mod wave64_approx_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -239,6 +241,45 @@ pub fn shader_opt() -> u32 {
 /// multiply-add, a fast reciprocal, scalar buffer loads of four dwords at once,
 /// a wave size for every compute program (32, 64, the console's).
 ///
+/// `VICTORY_WAVE64_APPROX=1` (off by default): on a host of 32-lane waves, a
+/// console wave64 compute program that every other form leaves refused is
+/// translated as two host waves that do not exchange
+/// (`lower::with_wave64_approx`): each half computes its own cross-lane
+/// results and no barrier is added. Approximate, but its dispatches run
+/// instead of being dropped. Part of the translation: the shader cache keys
+/// on it ([`host_settings`]).
+pub fn wave64_approx() -> bool {
+    #[cfg(test)]
+    if let Some(on) = WAVE64_APPROX_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| approx_asked(std::env::var("VICTORY_WAVE64_APPROX").ok().as_deref()))
+}
+
+/// Whether a value of `VICTORY_WAVE64_APPROX` turns it on: `1` only (any other value,
+/// `0` included, or none leaves it off).
+fn approx_asked(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`wave64_approx`].
+    pub(crate) static WAVE64_APPROX_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Says once per program (by its container's digest) that it was translated
+/// approximately (`VICTORY_WAVE64_APPROX=1`), and why it needed to be.
+fn report_approx(c: &Container, reason: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<[u8; 16]>>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_with(std::collections::HashSet::new).insert(c.digest) {
+        let hash: String = c.digest.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!("victory-shader: approximate wave64 {hash}: {reason}");
+    }
+}
+
 /// Part of the translation: the shader cache keys on it ([`host_settings`]).
 pub fn rdna_float() -> u32 {
     static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -510,7 +551,93 @@ pub(crate) fn within_host_wave(shader: HostShader, host: u32) -> Result<HostShad
 }
 
 /// [`emit`] for any wave size.
+///
+/// Last of all, with `VICTORY_WAVE64_APPROX=1` ([`wave64_approx`]) on a host of 32-lane
+/// waves: a console wave64 compute program every other form and retry (threading included)
+/// leaves refused is translated approximately ([`emit_approx`]).
 fn emit_any_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let exact = emit_retried(c, native, p, st, io, res);
+    if !(wave64_approx() && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32) {
+        return exact;
+    }
+    let reason = match &exact {
+        Ok(shader) if wanted_wave(&shader.dxil).is_some_and(|n| n > 32) => WIDER_THAN_HOST.to_string(),
+        // (a mask with lanes elsewhere is only helped by the exact forms, which `translate`
+        // tries next with mask operations on numbers)
+        Err(ShaderError::Unsupported { what, .. }) if *what != lower::MASK_ELSEWHERE => {
+            exact.as_ref().err().map(ToString::to_string).unwrap_or_default()
+        }
+        _ => return exact,
+    };
+    match emit_approx(c, native, p, st, io, res) {
+        Some(shader) => {
+            report_approx(c, &reason);
+            Ok(shader)
+        }
+        None => exact,
+    }
+}
+
+/// `VICTORY_WAVE64_APPROX=1`'s translation of a console wave64 compute program on a host of
+/// 32-lane waves (`lower::with_wave64_approx`): two host waves that do not exchange even
+/// where they could not, in the forms the local waves are tried in, then as it is. `None`
+/// unless one comes out in waves of 32. Respects `VICTORY_WAVE_LOCAL=0` (no local waves)
+/// and `idiom` (no approximate ones).
+fn emit_approx(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Option<HostShader> {
+    if std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "0" || v == "idiom") {
+        return None;
+    }
+    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    let form = |p: Option<ir::Program>| {
+        p.and_then(|p| {
+            let st = structure::structure(&p).ok()?;
+            let io = io::raise(&p, native).ok()?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+            Some((p, st, io, res))
+        })
+    };
+    let forms = [
+        ("without early-outs", form(ir::without_early_outs(p))),
+        ("without skips", form(ir::without_skips(p, false))),
+    ];
+    let tries = forms
+        .iter()
+        .filter_map(|(name, f)| f.as_ref().map(|(p, st, io, res)| (*name, p, st, io, res)))
+        .chain(std::iter::once(("as it is", p, st, io, res)));
+    for (name, p, st, io, res) in tries {
+        lower::take_needs();
+        let approx = lower::with_wave64_approx(|| emit_program(c, native, p, st, io, res));
+        if why {
+            match &approx {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY approximate wave64, {name}: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY approximate wave64, {name}: {e}"),
+            }
+        }
+        if let Ok((shader, wave)) = approx
+            && wave != Some(64)
+        {
+            return Some(shader);
+        }
+    }
+    None
+}
+
+/// [`emit_any_wave`] without its approximate last resort.
+fn emit_retried(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

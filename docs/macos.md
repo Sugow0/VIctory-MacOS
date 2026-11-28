@@ -68,7 +68,23 @@ What the runtime chooses from a capability it reports:
   (`crates/victory-gpu/src/host.rs`); a console wave64 program that cannot
   run in waves of 32 is refused by the translator (`emit::emit`,
   `WIDER_THAN_HOST`), and the test host refuses a wave size outside the
-  device's (`emit::host::Host::compute_pipeline_with`).
+  device's (`emit::host::Host::compute_pipeline_with`). A refused program's
+  dispatches are dropped, which may leave the title waiting for their
+  results. `VICTORY_WAVE64_APPROX=1` (off by default; any other value is
+  off) is a stop-gap for that: on a host of 32-lane waves, a program every
+  other form and retry leaves refused (the exact forms, the local waves,
+  threading) is translated as two waves of 32 that do not exchange
+  (`lower::with_wave64_approx`): each half computes its own cross-lane
+  results (a wave-wide sum becomes two half-wave ones), LDS the console
+  shares within its wave goes without the other half's order, and no
+  barrier is added (nor LDS for an exchange). It respects
+  `VICTORY_WAVE_LOCAL=0` and `VICTORY_WAVE_LOCAL=idiom` (both leave such
+  programs refused), and does not take a program refused at a lane mask
+  with lanes elsewhere, which only the exact forms help. Each such program
+  is logged once on stderr
+  (`approximate wave64 <container digest>: <reason>`). The switch is part of
+  the translation's key (`emit::host_settings`), so those translations are
+  not served to a run without it.
 - **Doubles.** `DoublePrecisionFloatShaderOps` is 0 and a double addition
   gives 0. The tests skip double arithmetic on such a device; the translator
   does not refuse console f64 code there (`v_add_f64` and the like): those

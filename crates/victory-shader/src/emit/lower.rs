@@ -1447,6 +1447,22 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_wave64_approx`].
+    static WAVE64_APPROX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// As [`with_local_waves_any`], and a console wave64 program whose two host
+/// waves could not exchange (an indirect exit, LDS the halves share within
+/// lane branches) is lowered as two waves of 32 all the same: each half
+/// computes its own cross-lane results and reads LDS without the other
+/// half's order, and no barrier is added (none can then sit where not every
+/// lane goes). Approximate; only behind `VICTORY_WAVE64_APPROX=1`
+/// ([`super::wave64_approx`]), for programs nothing else translates.
+pub(super) fn with_wave64_approx<R>(f: impl FnOnce() -> R) -> R {
+    let was = WAVE64_APPROX.replace(true);
+    let r = with_local_waves_any(f);
+    WAVE64_APPROX.set(was);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1517,15 +1533,23 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 6] {
-    [
+///
+/// With `VICTORY_WAVE64_APPROX=1` ([`super::wave64_approx`]) one more value,
+/// so approximate wave64 translations are never served to a run without the
+/// switch; without it the list (and every cached key) is as before.
+pub fn host_settings() -> Vec<u32> {
+    let mut settings = vec![
         host_max_wave(),
         super::shader::view_heap_limit(),
         super::shader::raw_views(),
         host_rdna(),
         u32::from(host_derived_vertices()),
         u32::from(host_metal_mesh_limit()),
-    ]
+    ];
+    if super::wave64_approx() {
+        settings.push(u32::from_le_bytes(*b"W64A"));
+    }
+    settings
 }
 
 static HOST_METAL_MESH_LIMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2000,6 +2024,17 @@ impl<'a> Lower<'a> {
                             }
                         }
                     }
+                }
+                // `VICTORY_WAVE64_APPROX=1`, last of all: two host waves that do not exchange
+                // (`local`), without the LDS barriers, wherever not every lane runs
+                if wave == 64 && WAVE64_APPROX.get() && LOCAL_WAVES.get() {
+                    wave = 32;
+                    split_lds = false;
+                    lds_meet = None;
+                    let all = all_lane_blocks(x.st).unwrap_or_else(|| vec![false; x.st.exits.len()]);
+                    // (`local` never reads or writes the exchange's dwords: none reserved, so
+                    // the group's LDS stays the console's)
+                    exchange = Some((s.lds_dwords, group <= 32, all));
                 }
                 // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
                 if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {

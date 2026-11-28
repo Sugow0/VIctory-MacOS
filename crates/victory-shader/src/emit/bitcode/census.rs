@@ -57,8 +57,18 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: modules are counted ([`enabled`]).
+    pub(crate) static COUNT_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Whether modules are counted (`VICTORY_SHADER_CENSUS` set).
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if COUNT_HERE.get() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CENSUS").is_some())
 }
