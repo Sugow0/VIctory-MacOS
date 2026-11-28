@@ -91,6 +91,9 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod mesh_link;
+#[cfg(test)]
+mod mesh_link_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -122,6 +125,7 @@ pub use lower::{
     host_settings, set_host_derived_vertices, set_host_max_wave, set_host_metal_mesh_limit, set_host_rdna,
     set_thread_max_wave,
 };
+pub use mesh_link::{host_mesh_link, mesh_fits_metal, mesh_over_limit_allowed, set_host_mesh_link, translate_linked};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -299,7 +303,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.push(u8::from(lower::host_derived_vertices()));
-    out.push(u8::from(lower::host_metal_mesh_limit()));
+    out.push(u8::from(lower::host_metal_mesh_limit()) | u8::from(mesh_link::host_mesh_link()) << 1);
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());

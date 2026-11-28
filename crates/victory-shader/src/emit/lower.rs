@@ -1524,7 +1524,8 @@ pub fn host_settings() -> [u32; 6] {
         super::shader::raw_views(),
         host_rdna(),
         u32::from(host_derived_vertices()),
-        u32::from(host_metal_mesh_limit()),
+        // (linking in bit 1: the keys without it stay as they were)
+        u32::from(host_metal_mesh_limit()) | u32::from(super::mesh_link::host_mesh_link()) << 1,
     ]
 }
 
@@ -1553,13 +1554,6 @@ pub(super) fn host_metal_mesh_limit() -> bool {
     HOST_METAL_MESH_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `VICTORY_MESH_OVER_LIMIT=1`: on D3DMetal, mesh shaders over Metal's
-/// 32 KiB are translated anyway (they hang the queue there).
-fn mesh_over_limit_allowed() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_OVER_LIMIT").is_some_and(|v| v != "0"))
-}
-
 /// Whether a mesh shader's outputs at the maxima fit the host's 32 KiB:
 /// by D3D12's count ([`container::mesh_output_bytes`]), and with `metal`
 /// (D3DMetal) also by Metal's aligned layout
@@ -1584,10 +1578,11 @@ pub(super) fn mesh_outputs_fit(
 
 /// Whether a mesh shader still over the limit at the lane count is refused:
 /// with `VICTORY_MESH_OUTPUT_STRICT` (`strict`) anywhere; on D3DMetal
-/// (`metal`) unless `VICTORY_MESH_OVER_LIMIT=1` (`over_limit`). Pure, for
-/// testing.
-pub(super) fn refuse_mesh_over_limit(strict: bool, metal: bool, over_limit: bool) -> bool {
-    strict || (metal && !over_limit)
+/// (`metal`) unless `VICTORY_MESH_OVER_LIMIT=1` (`over_limit`) or its
+/// pipeline decides once it has tried linking it with its pixel shader
+/// (`deferred`, `mesh_link`). Pure, for testing.
+pub(super) fn refuse_mesh_over_limit(strict: bool, metal: bool, over_limit: bool, deferred: bool) -> bool {
+    strict || (metal && !over_limit && !deferred)
 }
 
 static HOST_DERIVED_VERTICES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1902,6 +1897,17 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // A mesh shader linked with its pixel shader: both keep only what
+        // the pixel shader reads (`mesh_link`).
+        let kept = super::mesh_link::kept_outputs().filter(|_| matches!(x.native.stage, HwStage::Ps | HwStage::Ms));
+        if let Some(keep) = &kept {
+            s.repack_signatures = true;
+            if x.native.stage == HwStage::Ps {
+                super::mesh_link::prune_signature(&mut s.inputs, keep);
+            } else {
+                super::mesh_link::prune_signature(&mut s.outputs, keep);
+            }
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2086,6 +2092,9 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
+            if let Some(keep) = &kept {
+                super::mesh_link::prune_signature(&mut s.prims, keep);
+            }
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
             s.mesh = Some(super::shader::Mesh {
@@ -3140,6 +3149,13 @@ impl<'a> Lower<'a> {
             self.s
                 .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
         )
+    }
+
+    /// The pixel inputs as the console laid them out, for where its 16-bit
+    /// values sit: this program's own, unless a linked translation cut them
+    /// down (`mesh_link`).
+    fn layout_inputs(&self) -> &[SigElement] {
+        if self.s.repack_signatures { &self.x.inputs } else { &self.s.inputs }
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
@@ -5296,8 +5312,12 @@ impl<'a> Lower<'a> {
         // On D3DMetal the outputs must also fit by Metal's aligned layout:
         // a pipeline over it there is made, draws nothing and its submission
         // never completes (pragyaangaur/VIctory-macOS #172, PR #282).
+        // A linked translation (`mesh_link`) is measured by Metal's layout
+        // and refused when over: its pipeline then falls back on the mesh
+        // shader alone.
         let (outputs, prims) = (&self.s.outputs, &self.s.prims);
-        let metal = host_metal_mesh_limit();
+        let linked = self.s.repack_signatures;
+        let metal = host_metal_mesh_limit() || linked;
         let fits = |m: super::shader::Mesh| {
             mesh_outputs_fit(outputs, prims, m.max_vertices, m.max_primitives, metal)
         };
@@ -5309,8 +5329,12 @@ impl<'a> Lower<'a> {
             // them). Refused with `VICTORY_MESH_OUTPUT_STRICT=1`, and on
             // D3DMetal unless `VICTORY_MESH_OVER_LIMIT=1`: the pipeline is
             // not made and its draws are dropped, the queue keeps running.
+            // With linking on there, the pipeline refuses it instead, if its
+            // pair does not fit either.
             let strict = std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some();
-            if !fits(mesh) && refuse_mesh_over_limit(strict, metal, mesh_over_limit_allowed()) {
+            let over_limit = super::mesh_link::mesh_over_limit_allowed();
+            let deferred = super::mesh_link::host_mesh_link();
+            if !fits(mesh) && (linked || refuse_mesh_over_limit(strict, metal, over_limit, deferred)) {
                 return Err("a mesh shader whose outputs pass the host's 32 KiB");
             }
             self.s.mesh = Some(mesh);
@@ -11297,7 +11321,7 @@ impl<'a> Lower<'a> {
                 .find(|i| i.row == attribute.row && i.fp16)
                 .map(|i| {
                     let packs = if i.pack2 {
-                        input_packs(&self.x.native.io, &self.s.inputs)
+                        input_packs(&self.x.native.io, self.layout_inputs())
                     } else {
                         Vec::new()
                     };
@@ -11326,7 +11350,7 @@ impl<'a> Lower<'a> {
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, &packs, attribute.row, h)
+                        packed_half(l.layout_inputs(), &packs, attribute.row, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
@@ -13111,7 +13135,8 @@ impl<'a> Lower<'a> {
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
                     let src = if pack2 {
-                        packed_half(outputs, &packs, row, h)
+                        let layout = if self.s.repack_signatures { &self.x.outputs } else { outputs };
+                        packed_half(layout, &packs, row, h)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -13353,9 +13378,8 @@ impl<'a> Lower<'a> {
                 .iter()
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
-        let free: std::collections::BTreeSet<u32> = self
-            .s
-            .outputs
+        let outputs = if self.s.repack_signatures { &self.x.outputs } else { &self.s.outputs };
+        let free: std::collections::BTreeSet<u32> = outputs
             .iter()
             .filter(|o| o.kind == 0)
             .filter_map(|o| o.row)
@@ -14435,12 +14459,18 @@ mod tests {
     fn mesh_over_limit_is_refused_on_d3dmetal_unless_allowed() {
         use super::refuse_mesh_over_limit;
         // Windows: only with VICTORY_MESH_OUTPUT_STRICT, as before.
-        assert!(!refuse_mesh_over_limit(false, false, false));
-        assert!(!refuse_mesh_over_limit(false, false, true));
-        assert!(refuse_mesh_over_limit(true, false, false));
+        assert!(!refuse_mesh_over_limit(false, false, false, false));
+        assert!(!refuse_mesh_over_limit(false, false, true, false));
+        assert!(refuse_mesh_over_limit(true, false, false, false));
+        // (linking is only ever on with D3DMetal; it changes nothing here)
+        assert!(!refuse_mesh_over_limit(false, false, false, true));
+        assert!(refuse_mesh_over_limit(true, false, false, true));
         // D3DMetal: refused unless VICTORY_MESH_OVER_LIMIT=1.
-        assert!(refuse_mesh_over_limit(false, true, false));
-        assert!(!refuse_mesh_over_limit(false, true, true));
-        assert!(refuse_mesh_over_limit(true, true, true), "strict still wins");
+        assert!(refuse_mesh_over_limit(false, true, false, false));
+        assert!(!refuse_mesh_over_limit(false, true, true, false));
+        assert!(refuse_mesh_over_limit(true, true, true, false), "strict still wins");
+        // D3DMetal with linking: the pipeline decides after linking.
+        assert!(!refuse_mesh_over_limit(false, true, false, true));
+        assert!(refuse_mesh_over_limit(true, true, false, true), "strict still wins");
     }
 }

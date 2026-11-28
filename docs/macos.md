@@ -146,8 +146,28 @@ alone, `emit::host::on_d3dmetal`: under Wine with that adapter name):
   dropped and the queue keeps running. `VICTORY_MESH_OVER_LIMIT=1`
   translates it anyway. Elsewhere nothing changes: only
   `VICTORY_MESH_OUTPUT_STRICT=1` refuses, by D3D12's count. Ported from
-  pragyaangaur/VIctory-macOS PR #282, which also turns their mesh output
-  linking on under Wine; this fork has no such linking.
+  pragyaangaur/VIctory-macOS PR #282.
+- **Mesh shaders over that limit are linked with their pixel shaders.**
+  Many of the title's mesh shaders write attributes their pixel shader
+  never reads. On D3DMetal, linking is on by default
+  (`VICTORY_LINK_MESH_OUTPUTS=0` turns it off and brings back the refusal
+  above, at translation): a mesh shader over the limit is then translated
+  alone without being refused, and when its pipeline is made
+  (`crates/victory-gpu/src/pipeline/link.rs`) the pair is translated again
+  (`emit::translate_linked`, `emit/mesh_link.rs`). The pixel shader's
+  `ISG1` says which arbitrary inputs it reads, and which channels; the
+  mesh shader keeps only those outputs, trimmed to those channels, ordered
+  by size (4, 2, 1 then 3 components) and repacked into rows, so Metal's
+  aligned layout has no holes between a scalar and a `float4`; the pixel
+  shader is translated with the same inputs. System values stay on both
+  sides, and D3D12 links the two by semantic. If the pair fits, the
+  pipeline is made with it; if not, or the pair does not translate, the
+  pipeline is refused (its draws are dropped), or made with the mesh
+  shader alone with `VICTORY_MESH_OVER_LIMIT=1`. Pairs are kept for the
+  run by both containers' full hashes, failures included, and not in the
+  shader cache. Elsewhere nothing links. Ported from
+  pragyaangaur/VIctory-macOS PR #161 (linking), #401 (on Metal's aligned
+  count, ordering by size) and #282 (on by default under D3DMetal).
 - **CPU descriptor handles are no addresses.** CrossOver's d3d12 hands out
   encoded handles (D3D12 says they are opaque), so reading a descriptor
   through its handle fails (error 299). The AMD "raw twin" trick, which
