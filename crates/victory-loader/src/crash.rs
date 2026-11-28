@@ -9,8 +9,16 @@
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
 //! often states the reason. Panics of ours go to the crash log too.
+//!
+//! One breakpoint is not fatal: the title's full-pool trap, which the
+//! handler steps over (`VICTORY_STEP_OVER`, see `step_over.rs`; ported
+//! from pragyaangaur/VIctory-macOS PR #284).
 
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+use crate::clwb::clwb_loop;
+use crate::step_over::{SITE_BYTES, Site};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -108,6 +116,89 @@ fn title_output() -> String {
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
+/// The sites `VICTORY_STEP_OVER` asks for (see `step_over.rs`), each with
+/// how often a thread went on behind it. Set by [`report_crashes`].
+static STEP_OVER: std::sync::OnceLock<Vec<(Site, AtomicU64)>> = std::sync::OnceLock::new();
+
+/// Where title images are mapped, for [`STEP_OVER`]'s offsets: read by the
+/// exception handler, which takes no lock. 0 is an empty place.
+static IMAGE_BASES: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+
+/// The ends of the images of [`IMAGE_BASES`], place by place.
+static IMAGE_ENDS: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+
+/// A title image of `size` bytes was mapped at `base`.
+pub(crate) fn note_image(base: usize, size: usize) {
+    if base == 0 || IMAGE_BASES.iter().any(|b| b.load(Relaxed) == base) {
+        return;
+    }
+    for (place, end) in IMAGE_BASES.iter().zip(&IMAGE_ENDS) {
+        if place.compare_exchange(0, base, Relaxed, Relaxed).is_ok() {
+            // Until the end is stored it reads 0, and no site fits.
+            end.store(base + size, Relaxed);
+            return;
+        }
+    }
+}
+
+/// The end of the title image mapped at `base`, if one is.
+fn image_end(base: usize) -> Option<usize> {
+    IMAGE_BASES
+        .iter()
+        .zip(&IMAGE_ENDS)
+        .find(|(b, _)| b.load(Relaxed) == base)
+        .map(|(_, e)| e.load(Relaxed))
+}
+
+/// Whether the exception is a breakpoint at one of `sites`, in a title
+/// image, with the bytes the site's check asks for: then the thread goes
+/// on behind the `int3`, and the step is counted and logged.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+unsafe fn step_over(sites: &[(Site, AtomicU64)], info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: the system passes valid exception pointers.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode != EXCEPTION_BREAKPOINT || sites.is_empty() {
+        return false;
+    }
+    let at = record.ExceptionAddress as usize;
+    for (site, count) in sites {
+        let Some(base) = at.checked_sub(site.offset).filter(|&b| b != 0) else {
+            continue;
+        };
+        let Some(end) = image_end(base) else {
+            continue;
+        };
+        if at + SITE_BYTES > end {
+            continue;
+        }
+        // SAFETY: bytes of a mapped title image's code, where the thread
+        // just ran, all inside the image.
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, SITE_BYTES) };
+        if !crate::step_over::matches(site.check, bytes) {
+            continue;
+        }
+        // SAFETY: the faulting thread's context, for the exception being dispatched.
+        let ctx = unsafe { &mut *(*info).ContextRecord };
+        // Windows reports an int3 at its own address; past it is the next
+        // instruction.
+        if ctx.Rip as usize == at {
+            ctx.Rip += 1;
+        }
+        let n = count.fetch_add(1, Relaxed) + 1;
+        if crate::step_over::worth_logging(n) {
+            tracing::warn!(
+                offset = format_args!("{:#x}", site.offset),
+                n,
+                "stepped over the title's breakpoint (VICTORY_STEP_OVER): the code behind the trap goes on"
+            );
+        }
+        return true;
+    }
+    false
+}
+
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
@@ -115,6 +206,19 @@ pub fn report_crashes() {
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
+    STEP_OVER.get_or_init(|| {
+        let asked = std::env::var("VICTORY_STEP_OVER").ok();
+        let (sites, unknown) = crate::step_over::sites(asked.as_deref());
+        if !unknown.is_empty() {
+            tracing::warn!(
+                ?unknown,
+                "VICTORY_STEP_OVER: expected pool, 0 or hex offsets; these are left out"
+            );
+        }
+        let offsets: Vec<String> = sites.iter().map(|s| format!("{:#x}", s.offset)).collect();
+        tracing::info!(?offsets, "breakpoints stepped over (VICTORY_STEP_OVER)");
+        sites.into_iter().map(|s| (s, AtomicU64::new(0))).collect()
+    });
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -227,26 +331,6 @@ fn clwb_len(code: &[u8]) -> Option<usize> {
     (len <= code.len()).then_some(len)
 }
 
-/// A `clwb` write-back loop as the title's compilers build it, one cache line a
-/// pass (`base` and `limit` any registers):
-///
-/// ```text
-/// top: clwb [base]
-///      add  base, 0x40
-///      cmp  base, limit
-///      jbe  top
-/// ```
-///
-/// An exception costs about a microsecond and the title writes back whole
-/// buffers this way while it loads, so the loop is done in one: `clwb` has
-/// nothing to do on the PC, `base` ends past `limit` as the last pass leaves it.
-struct ClwbLoop {
-    base: u8,
-    limit: u8,
-    /// Bytes from `clwb` to the instruction after `jbe`.
-    len: usize,
-}
-
 /// The `base` value left after a `clwb_loop` finishes without wrapping past
 /// `u64::MAX`, or `None` if `add base, 0x40` would overflow or wrap (in which
 /// case we fall through to single-instruction `clwb` emulation).
@@ -258,44 +342,6 @@ fn clwb_loop_end(base: u64, limit: u64) -> Option<u64> {
     };
     let end = base.checked_add(step)?;
     (end > limit).then_some(end)
-}
-
-fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
-    // clwb [base]: 66 [40|41] 0f ae, ModRM mod 00, reg 6, no SIB or displacement.
-    let (rex, at) = match code.get(1)? {
-        0x40 | 0x41 => (code[1], 2),
-        _ => (0, 1),
-    };
-    if *code.first()? != 0x66 || code.get(at..at + 2)? != [0x0f, 0xae] {
-        return None;
-    }
-    let modrm = *code.get(at + 2)?;
-    let rm = modrm & 7;
-    if modrm >> 6 != 0 || (modrm >> 3) & 7 != 6 || rm == 4 || rm == 5 {
-        return None;
-    }
-    let base = rm | (rex & 1) << 3;
-    // add base, 0x40: REX.W(+B) 83 /0 ib.
-    let add = at + 3;
-    if *code.get(add..add + 4)? != [0x48 | base >> 3, 0x83, 0xc0 | (base & 7), 0x40] {
-        return None;
-    }
-    // cmp base, limit: REX.W 39 /r with base in r/m.
-    let cmp = add + 4;
-    let &[cmp_rex @ 0x48..=0x4f, 0x39, cmp_modrm] = code.get(cmp..cmp + 3)? else {
-        return None;
-    };
-    if cmp_modrm >> 6 != 3 || (cmp_modrm & 7 | (cmp_rex & 1) << 3) != base {
-        return None;
-    }
-    let limit = (cmp_modrm >> 3) & 7 | (cmp_rex & 4) << 1;
-    // jbe top.
-    let jump = cmp + 3;
-    let len = jump + 2;
-    if *code.get(jump)? != 0x76 || i64::from(*code.get(jump + 1)? as i8) != -(len as i64) {
-        return None;
-    }
-    (limit != base).then_some(ClwbLoop { base, limit, len })
 }
 
 /// `clzero` at `context.Rip`. An exception costs about a microsecond and
@@ -467,6 +513,13 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // A trap of the title's that `VICTORY_STEP_OVER` lets it go on behind.
+    // SAFETY: the system passes valid exception pointers.
+    if let Some(sites) = STEP_OVER.get()
+        && unsafe { step_over(sites, info) }
+    {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
     if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
@@ -1449,6 +1502,123 @@ mod tests {
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// The exception a thread at `at` raises with `code`, and its context.
+    fn exception_at(code: i32, at: usize) -> (EXCEPTION_RECORD, Box<CONTEXT>) {
+        // SAFETY: plain C structures, all zeroes is a valid value.
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = code;
+        record.ExceptionAddress = at as *mut _;
+        // SAFETY: as above.
+        let mut context: Box<CONTEXT> = Box::new(unsafe { std::mem::zeroed() });
+        context.Rip = at as u64;
+        (record, context)
+    }
+
+    #[test]
+    fn steps_over_a_checked_pool_trap_only() {
+        use crate::step_over::Check;
+        // A stand-in image: the title's bytes at +0x5149aec, at +0x10.
+        let mut image = vec![0x90u8; 0x40];
+        image[0x10..0x14].copy_from_slice(&[0xcc, 0x31, 0xff, 0x48]);
+        image[0x20..0x24].copy_from_slice(&[0xcc, 0x90, 0x90, 0x90]);
+        let base = image.as_ptr() as usize;
+        let sites = |offset| {
+            [(
+                Site {
+                    offset,
+                    check: Check::PoolTrap,
+                },
+                AtomicU64::new(0),
+            )]
+        };
+        let try_at = |list: &[(Site, AtomicU64)], code, at| {
+            let (mut record, mut context) = exception_at(code, at);
+            let mut info = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut *context,
+            };
+            // SAFETY: pointers to the exception just built, and `at` in `image`.
+            let stepped = unsafe { step_over(list, &mut info) };
+            (stepped, context.Rip as usize)
+        };
+        // Not a title image yet: nothing.
+        let pool = sites(0x10);
+        assert_eq!(
+            try_at(&pool, EXCEPTION_BREAKPOINT, base + 0x10),
+            (false, base + 0x10)
+        );
+        note_image(base, image.len());
+        assert_eq!(
+            try_at(&pool, EXCEPTION_BREAKPOINT, base + 0x10),
+            (true, base + 0x11)
+        );
+        assert_eq!(
+            try_at(&pool, EXCEPTION_BREAKPOINT, base + 0x10),
+            (true, base + 0x11)
+        );
+        assert_eq!(pool[0].1.load(Relaxed), 2, "each step is counted");
+        // Another exception there, or a breakpoint elsewhere: not ours.
+        assert!(!try_at(&pool, EXCEPTION_ACCESS_VIOLATION, base + 0x10).0);
+        assert!(!try_at(&pool, EXCEPTION_BREAKPOINT, base + 0x11).0);
+        // The site's bytes are not the pool's trap: left to be fatal.
+        assert_eq!(
+            try_at(&sites(0x20), EXCEPTION_BREAKPOINT, base + 0x20),
+            (false, base + 0x20)
+        );
+        // A site whose bytes would run past the image's end.
+        assert!(!try_at(&sites(0x3e), EXCEPTION_BREAKPOINT, base + 0x3e).0);
+        assert!(!try_at(&[], EXCEPTION_BREAKPOINT, base + 0x10).0);
+    }
+
+    /// A real `int3` through a vectored handler that steps over it: the
+    /// code behind runs (`int3; xor eax, eax; add eax, 7; ret` gives 7).
+    #[test]
+    fn a_thread_goes_on_behind_a_real_pool_trap() {
+        use crate::step_over::Check;
+        use windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        static SITES: std::sync::OnceLock<[(Site, AtomicU64); 1]> = std::sync::OnceLock::new();
+        unsafe extern "system" fn ours(info: *mut EXCEPTION_POINTERS) -> i32 {
+            match SITES.get() {
+                // SAFETY: the system passes valid exception pointers.
+                Some(sites) if unsafe { step_over(sites, info) } => -1,
+                _ => EXCEPTION_CONTINUE_SEARCH,
+            }
+        }
+        SITES.get_or_init(|| {
+            [(
+                Site {
+                    offset: 0x10,
+                    check: Check::PoolTrap,
+                },
+                AtomicU64::new(0),
+            )]
+        });
+        // SAFETY: a page of our own, run as code only once written, and
+        // freed after; the handler is removed before that.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as *mut u8;
+            assert!(!page.is_null());
+            let code = [0xcc, 0x31, 0xc0, 0x83, 0xc0, 0x07, 0xc3];
+            std::ptr::copy_nonoverlapping(code.as_ptr(), page.add(0x10), code.len());
+            note_image(page as usize, 0x1000);
+            let handler = AddVectoredExceptionHandler(1, Some(ours));
+            let run: extern "C" fn() -> u32 = std::mem::transmute(page.add(0x10));
+            let got = run();
+            RemoveVectoredExceptionHandler(handler);
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+            assert_eq!(got, 7);
+            assert_eq!(SITES.get().unwrap()[0].1.load(Relaxed), 1);
         }
     }
 }
