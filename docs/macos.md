@@ -306,6 +306,18 @@ wine64 target/x86_64-pc-windows-msvc/diag/victory.exe warm --used
 
 To pick an adapter, as on Windows: `--more VICTORY_D3D12_ADAPTER=<index or name>`.
 
+The title has a hang watchdog: a thread that ends the process if the main
+loop has not ticked for 30 one-second checks, or a scoped timer is older
+than 300 s. Under Rosetta and Wine the world load outlasts the 30 s, and the
+title ended itself while loading. `VICTORY_HANG_WATCHDOG` (read at load):
+unset, the watchdog is off under Wine and left on on Windows; `0` turns it
+off, `1` keeps it, anywhere. Off means its three jumps to the crash become
+two-byte nops (`crates/victory-loader/src/hang_watchdog.rs`), only for the
+executable of BLAKE3 `b99f876b…` (Series 1.0.2.1) and only when all three
+sites hold the bytes expected; otherwise the title is left alone. One
+`hang watchdog:` line in the log says which. A title that really hangs then
+stays hung instead of ending.
+
 ## Verifying a merge
 
 After upstream is merged into `port-macos`, one command checks a commit on
