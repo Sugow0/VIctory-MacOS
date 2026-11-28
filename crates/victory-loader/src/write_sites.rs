@@ -258,6 +258,11 @@ pub unsafe fn apply(name: &str, base: usize, size: usize, list: &str) -> usize {
         let Some(jump) = crate::console_insn::jump(at, to) else {
             continue;
         };
+        // Bytes another of our patches rewrote (`wide.rs`'s split stores): theirs.
+        if crate::patched::overlaps(at, len) {
+            tracing::warn!(image, offset = format_args!("{offset:#x}"), "left alone: another patch rewrote these bytes already");
+            continue;
+        }
         if *used + body.len() > crate::console_insn::STUBS_LEN {
             return done;
         }
@@ -274,6 +279,7 @@ pub unsafe fn apply(name: &str, base: usize, size: usize, list: &str) -> usize {
             VirtualProtect(at as *const _, len, old, &mut old);
             FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
         }
+        crate::patched::take(at, len);
         *used += body.len().next_multiple_of(16);
         done += 1;
     }

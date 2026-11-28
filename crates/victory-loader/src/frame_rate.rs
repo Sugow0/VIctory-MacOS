@@ -211,6 +211,8 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
                     VirtualProtect(at as *const _, len, old, &mut old);
                     FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
                 }
+                // Noted, so that `wide.rs` does not move these bytes.
+                crate::patched::take(at, len);
                 Patched::Done
             })();
             let offset = format_args!("{:#x}", site.at);

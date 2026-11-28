@@ -306,6 +306,69 @@ wine64 target/x86_64-pc-windows-msvc/diag/victory.exe warm --used
 
 To pick an adapter, as on Windows: `--more VICTORY_D3D12_ADAPTER=<index or name>`.
 
+## Plain 256-bit stores into protected pages stop Rosetta
+
+Rosetta 2 stops the process with "rosetta error: unexpectedly need to
+EmulateForward on a synchronous exception", before any handler runs, when a
+32-byte store (`vmovups`, `vmovdqu`, `vmovaps` of a `ymm` register) begins in
+a writable page and faults in the next one, for instance
+`vmovups [r8+0x34], ymm0` across into a page Wine write-protects for
+`MEM_WRITE_WATCH` or that our view guards (`crates/victory-gpu/src/watch.rs`)
+protect. The same store wholly inside one page resumes, and 128-bit stores,
+`vextractf128` to memory and smaller stores resume in every layout (measured
+by pragyaangaur/VIctory-macOS under CrossOver on an M5 Max, macOS 26; not
+measured here). Its fix is ported: `VICTORY_PATCH_WIDE` and
+`VICTORY_PATCH_WIDE_DIR`, both off when unset.
+
+The sites are listed offline, as offsets and lengths only, from the title
+image VIctory writes to its cache (`<cache_dir>/images/victory-image-<16 hex
+digits>.dll`, the first 16 hex digits of the title's hash), with
+`llvm-objdump` (`brew install llvm`):
+
+```sh
+cargo xtask wide-stores "<cache_dir>/images/victory-image-<16 hex digits>.dll" > wide-sites.txt
+scripts/play-macos.sh --exe <path> --more 'VICTORY_PATCH_WIDE=Z:\path\to\wide-sites.txt'
+```
+
+Only stores wholly inside a function `.pdata` lists are taken (a leaf
+function without unwind data is left out), in functions where the listing
+starts an instruction at the function's first byte. MSVC puts switch tables
+of 4-byte RVAs, and the byte index tables of two-level switches, in `.text`,
+where the listing decodes them as code: a table named by a load
+`[base + 4*index + RVA]` (or a `lea r, [rip + X]` of two such entries or
+more) is skipped, with every store in it or after it in its function, and its
+entries become branch targets. So do the code addresses in the other
+sections' 4-byte words, `lea r, [rip + X]` into `.text` and the 64-bit
+addresses `.reloc` fixes up. The list's first line names the image it was
+made from (`# victory-wide-stores time=<TimeDateStamp> size=<SizeOfImage>
+sum=<CheckSum>`); a list whose first line does not match the image, or that
+has none, is refused whole.
+
+With `VICTORY_PATCH_WIDE=<list>` (unset, empty or `0`: off),
+`crates/victory-loader/src/wide.rs` turns each listed store of the executable
+into a jump to a trampoline that writes the low half with the same store at
+128 bits and the high half with `vextractf128 [m+16], ymm, 1`, then jumps
+back. A store of four bytes has no room for the jump: its site takes in the
+instructions next to it that can be moved (copied, RIP-relative ones with
+their displacement redone, conditional and plain jumps re-encoded), never
+across a branch target or a function bound of `.pdata`. A `call` the static
+TLS redirect (`tls.rs`) wrote over a copied `mov r64, gs:[0x58]` is re-aimed
+at its thunk (pragyaangaur/VIctory-macOS #556).
+
+Every site's bytes are checked before it is patched. One that does not match
+(another build, or bytes another of our load-time patches rewrote:
+`VICTORY_WRITE_SITES`, renderer port 2's record stores) is left alone, logged
+and counted. The trampolines are written last of the patches, and the bytes
+each patch rewrites are noted (`crates/victory-loader/src/patched.rs`) so
+none writes over another's. The run prints `wide stores N split into 128-bit
+halves (M refused)`, and the log counts the refusals by reason. A store such
+a hook already took stays 256 bits wide inside the hook's own code.
+
+`VICTORY_PATCH_WIDE_DIR=<folder>` does the same for the title's DLLs: each
+DLL's list, made the same way from its own cached image
+`victory-image-<16 hex digits>.dll`, is read from `<folder>/<the same 16 hex
+digits>.txt`; a DLL without a file there is left alone.
+
 ## Verifying a merge
 
 After upstream is merged into `port-macos`, one command checks a commit on

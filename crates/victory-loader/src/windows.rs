@@ -84,6 +84,20 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
+    // A title DLL's 256-bit stores split, from its own list
+    // (`VICTORY_PATCH_WIDE_DIR/<the 16 hex digits of its cached image>.txt`,
+    // made with `cargo xtask wide-stores`); the executable's comes from
+    // `VICTORY_PATCH_WIDE` (`apps/victory/src/run.rs`).
+    if loaded.info.is_dll() {
+        let hash = prepared.original_hash.to_hex();
+        let size = loaded.info.size_of_image as usize;
+        // SAFETY: just mapped, and no code of it has run.
+        if let Some((n, refused)) =
+            unsafe { crate::wide::patch_dll_asked(loaded.base() as u64, size, &hash.as_str()[..16]) }
+        {
+            tracing::info!(image = %loaded.path.display(), n, refused, "wide stores of a title DLL split (VICTORY_PATCH_WIDE_DIR)");
+        }
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
