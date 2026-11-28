@@ -24,6 +24,7 @@
 // Most of the runtime is Windows-only; elsewhere its helpers go unused.
 #![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_variables, unused_mut))]
 
+pub(crate) mod clwb;
 #[cfg(windows)]
 mod console_insn;
 #[cfg(windows)]
@@ -35,6 +36,7 @@ pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;
 pub mod resolve;
+pub(crate) mod step_over;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -56,6 +58,8 @@ pub use crash::{
 };
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
+#[cfg(windows)]
+pub use clwb::nop_clwb_loops;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]

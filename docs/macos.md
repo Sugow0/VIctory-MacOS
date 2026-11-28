@@ -306,6 +306,16 @@ wine64 target/x86_64-pc-windows-msvc/diag/victory.exe warm --used
 
 To pick an adapter, as on Windows: `--more VICTORY_D3D12_ADAPTER=<index or name>`.
 
+### Two load-time fixes for Rosetta runs
+
+Both are ported from pragyaangaur/VIctory-macOS (PRs #284 and #152) and
+are checked against the bytes of retail 1.0.2.1 (image `b99f876b74d4a77f`).
+
+| Switch | Default | What it does |
+|---|---|---|
+| `VICTORY_STEP_OVER` | `pool` | Steps over the title's full-pool trap at `+0x5149aec` (`int3; xor edi, edi`, the instance lists' allocator, Marvisak/VIctory#698), whose caller at `+0xa5db22` tests the NULL it then gets. Without it the run ends there about 20 minutes into the opening when frames take seconds. Only where the bytes are an `int3` followed by a zeroing `xor`, in a mapped title image; each step is counted and logged (the first three, then at powers of two). `0`, `off` or `none` turns it off; a comma list of `pool` and hex offsets (`pool,63966f`) steps over the offsets named too, wherever an `int3` is. |
+| `VICTORY_NOP_CLWB` | on under Wine | Turns the `clwb` of the title's eight write-back loops (`clwb [r]; add r, 0x40; cmp r, limit; jbe`) into NOPs of the same length once the image is mapped, before any title thread runs. Under Rosetta `clwb` faults, and the world load cost about 15,000 exceptions a second. It patches only when it finds exactly eight loops (logged otherwise) and checks each loop's bytes again as it writes. Wine is told by ntdll's `wine_get_version`. `0` leaves the loops alone, `1` patches them outside Wine too. Logged as `clwb loops` at start. |
+
 ## Verifying a merge
 
 After upstream is merged into `port-macos`, one command checks a commit on

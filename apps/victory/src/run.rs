@@ -100,6 +100,16 @@ pub fn run(
         image.base(),
         image.info().image_base
     );
+    // clwb faults under Rosetta, an exception per write-back loop: the
+    // loops' clwb made NOPs under Wine (`VICTORY_NOP_CLWB=0`/`1` to choose).
+    #[cfg(windows)]
+    if execute {
+        // SAFETY: the image is mapped and nothing of it has run yet.
+        match unsafe { victory_loader::nop_clwb_loops(image.base(), image.info()) } {
+            Some(n) => println!("clwb loops     {n} made NOPs"),
+            None => println!("clwb loops     left as they are"),
+        }
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
