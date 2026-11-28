@@ -29,7 +29,14 @@ pub mod structure;
 /// translated before is kept across the rebuild. `victory shaders`
 /// translates again what an earlier build of the translator cached and says
 /// how many came out different: if any did, the bump was due.
-pub const TRANSLATOR_VERSION: u32 = 1;
+/// 2: every container carries its own shader hash (`HASH`, the MD5 of its
+/// program) instead of zeros, so D3DMetal's shader cache tells programs apart.
+/// 3 (fix/wave64-whole-wave-flow): a console wave64 compute program of 64 threads on a host
+/// of 32-lane waves takes whole-wave flow (`emit/literal.rs`) instead of the wave-wide
+/// branches (`widen`) an earlier build may have cached, and a loop's own branch block is no
+/// longer taken as every lane's there. (Another branch bumping too: take the next number
+/// past both on merge.)
+pub const TRANSLATOR_VERSION: u32 = 3;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
