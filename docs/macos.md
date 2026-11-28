@@ -117,6 +117,37 @@ alone, `emit::host::on_d3dmetal`: under Wine with that adapter name):
   pipeline, and `D3D12CreateRootSignatureDeserializer` takes a truncated
   root signature (`S_OK`): a damaged blob is not caught there as on
   Windows.
+- **Its shader cache is keyed on the shader hash.** D3DMetal keeps compiled
+  shaders per executable on disk
+  (`$(getconf DARWIN_USER_CACHE_DIR)d3dm/<exe name>/shaders.cache`) and
+  finds them by the container's shader hash (the `HASH` part), apparently
+  with the length. Every container used to carry an all-zero shader hash, so
+  two different shaders of the same length shared an entry and the second
+  ran the first one's code, on every later run too. The translator now
+  writes the MD5 of the `DXIL` part there (`container::shader_hash`, ported
+  from pragyaangaur/VIctory-macOS PR #4), on every host: the optional
+  `dxil.dll` validator signs only the container digest. This changed every
+  translation, so `victory_shader::TRANSLATOR_VERSION` went to 2 and cached
+  translations are made again. Entries D3DMetal wrote under the zero hash
+  are never looked up again.
+- **Mesh outputs over 32 KiB by Metal's layout hang the queue.** D3D12
+  counts 4 bytes per output component; the layout Metal allocates puts clip
+  and cull distances first, then the position, then each other output
+  aligned to its own size, the same for primitives, times the declared
+  maxima. A mesh shader at or under 32 KiB by the first count can be over
+  by the second (34,816 to 38,400 bytes for about 20 world mesh shaders),
+  and D3DMetal makes such a pipeline, whose submission then never completes
+  (the world-entry hang of pragyaangaur/VIctory-macOS issue #172). On
+  D3DMetal (`emit::set_host_metal_mesh_limit`, set from `on_d3dmetal` in
+  `crates/victory-gpu/src/host.rs`, part of the translation fingerprint) a
+  mesh shader over by either count gets its maxima lowered to its lane
+  count, as one over D3D12's count already did everywhere, and if still
+  over it is refused (`emit::lower::mesh_outputs_fit`): its draws are
+  dropped and the queue keeps running. `VICTORY_MESH_OVER_LIMIT=1`
+  translates it anyway. Elsewhere nothing changes: only
+  `VICTORY_MESH_OUTPUT_STRICT=1` refuses, by D3D12's count. Ported from
+  pragyaangaur/VIctory-macOS PR #282, which also turns their mesh output
+  linking on under Wine; this fork has no such linking.
 - **CPU descriptor handles are no addresses.** CrossOver's d3d12 hands out
   encoded handles (D3D12 says they are opaque), so reading a descriptor
   through its handle fails (error 299). The AMD "raw twin" trick, which
