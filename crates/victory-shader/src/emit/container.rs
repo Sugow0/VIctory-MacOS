@@ -357,6 +357,87 @@ pub(crate) fn build(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     out
 }
 
+/// The shader hash part (`HASH`): flags (0, no source included) and the
+/// standard MD5 of the `DXIL` part (program header and bitcode). Apple's
+/// D3DMetal keys its on-disk shader cache on this hash, apparently with the
+/// length: with one shared all-zero value, two shaders of the same length
+/// got each other's compiled code, on every later run too. The validator
+/// (`validator.rs`, tests and the offline batch only) signs the container
+/// digest, never this part, so it is always ours. DXC's own hash may cover a
+/// slightly different span; D3DMetal only needs it to differ between
+/// programs. Ported from pragyaangaur/VIctory-macOS PR #4.
+pub(crate) fn shader_hash(dxil: &[u8]) -> [u8; 20] {
+    let mut out = [0; 20];
+    out[4..].copy_from_slice(&md5(dxil));
+    out
+}
+
+/// Standard MD5 (RFC 1321). Ported from pragyaangaur/VIctory-macOS PR #4.
+pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
+    let len = data.len();
+    let mut tail = data[len - len % 64..].to_vec();
+    tail.push(0x80);
+    while tail.len() % 64 != 56 {
+        tail.push(0);
+    }
+    tail.extend(((len as u64) << 3).to_le_bytes());
+    let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    for block in data[..len - len % 64]
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .chain(tail.as_chunks::<64>().0)
+    {
+        md5_block(&mut state, block);
+    }
+    let mut out = [0; 16];
+    for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        o.copy_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// A mesh shader's output size as Metal lays it out (measured on D3DMetal):
+/// per vertex the clip and cull distances, then the position (16 bytes),
+/// then every other output in signature order, each aligned to its own
+/// size; the same for the primitive outputs; times the declared maxima (not
+/// rounded). Over 32 KiB D3DMetal makes the pipeline, which then hangs the
+/// queue for good (pragyaangaur/VIctory-macOS issue #172), though
+/// [`mesh_output_bytes`] may put it under. As measured there, the distances
+/// are counted again in signature order. Ported from
+/// pragyaangaur/VIctory-macOS PR #282 (`metal_mesh_bytes`).
+pub(crate) fn metal_mesh_output_bytes(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u64 {
+    const POSITION: u32 = 1;
+    const DISTANCES: [u32; 2] = [2, 3];
+    let layout = |sizes: &mut dyn Iterator<Item = u64>| {
+        sizes
+            .filter(|&size| size > 0)
+            .fold(0, |end: u64, size| end.next_multiple_of(size) + size)
+    };
+    let distances: u64 = vertex
+        .iter()
+        .filter(|e| DISTANCES.contains(&e.system_value()))
+        .map(|e| u64::from(e.cols))
+        .sum();
+    let vertex_bytes = layout(
+        &mut std::iter::repeat_n(4, distances as usize)
+            .chain([16])
+            .chain(
+                vertex
+                    .iter()
+                    .filter(|e| e.system_value() != POSITION)
+                    .map(|e| 4 * u64::from(e.cols)),
+            ),
+    );
+    let primitive_bytes = layout(&mut primitive.iter().map(|e| 4 * u64::from(e.cols)));
+    u64::from(max_vertices) * vertex_bytes + u64::from(max_primitives) * primitive_bytes
+}
+
 /// The container hash D3D12 checks: MD5 whose last block carries the bit
 /// count first and `2 × bytes + 1` last instead of standard padding.
 pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
@@ -513,6 +594,108 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    /// Ported from pragyaangaur/VIctory-macOS PR #4.
+    #[test]
+    fn md5_matches_rfc_1321() {
+        let hex = |d: [u8; 16]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        // RFC 1321's test suite: empty, one block, 55 and 56 bytes (where
+        // the padding spills into a second block), and two full blocks.
+        for (input, want) in [
+            (&b""[..], "d41d8cd98f00b204e9800998ecf8427e"),
+            (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+            (
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                "d174ab98d277d9f5a5611c2c9f419d9f",
+            ),
+            (
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                "57edf4a22be3c955ac49da2e2107b67a",
+            ),
+        ] {
+            assert_eq!(hex(md5(input)), want, "{:?}", String::from_utf8_lossy(input));
+        }
+        assert_eq!(hex(md5(&[0x61; 55])), "ef1772b6dff9a122358552954ad0df65");
+        assert_eq!(hex(md5(&[0x61; 56])), "3b0c8ac703f828b04c6c197006d17218");
+    }
+
+    /// Ported from pragyaangaur/VIctory-macOS PR #4.
+    #[test]
+    fn shader_hashes_differ_between_programs() {
+        let (a, b) = (shader_hash(b"program a"), shader_hash(b"program b"));
+        assert_eq!(a[..4], [0; 4], "flags");
+        assert_ne!(a, b);
+        assert_eq!(a, shader_hash(b"program a"));
+    }
+
+    /// Two programs of the same length: the containers' `HASH` parts
+    /// (D3DMetal's cache key) differ, and neither is all zero.
+    #[test]
+    fn containers_of_equal_length_carry_different_shader_hashes() {
+        let part = |c: &[u8]| {
+            let at = c.windows(4).position(|w| w == b"HASH").unwrap() + 8;
+            c[at..at + 20].to_vec()
+        };
+        let make = |dxil: &[u8]| {
+            let hash = shader_hash(dxil);
+            build(&[(b"HASH", &hash), (b"DXIL", dxil)])
+        };
+        let (a, b) = (make(b"program a"), make(b"program b"));
+        assert_eq!(a.len(), b.len());
+        assert_ne!(part(&a), part(&b));
+        assert_ne!(part(&a), [0; 20]);
+    }
+
+    fn out(name: &str, kind: u8, cols: u8) -> SigElement {
+        SigElement {
+            cols,
+            ..el(name, kind, 9, 2, 0, 0, 1)
+        }
+    }
+
+    /// Metal's aligned layout against the packed count (the rule of
+    /// pragyaangaur/VIctory-macOS PR #282).
+    #[test]
+    fn metal_mesh_layout_aligns_each_output_to_its_size() {
+        // Position and one float3, aligned to 12 (at 24): 36 bytes.
+        let v = [out("SV_Position", 3, 4), out("TEXCOORD", 0, 3)];
+        assert_eq!(metal_mesh_output_bytes(&v, &[], 1, 0), 36);
+        // A float after it ends at 40, a float2 after that at 48.
+        let v = [
+            out("SV_Position", 3, 4),
+            out("TEXCOORD", 0, 3),
+            out("TEXCOORD", 0, 1),
+            out("TEXCOORD", 0, 2),
+        ];
+        assert_eq!(metal_mesh_output_bytes(&v, &[], 1, 0), 48);
+        // Clip distances first (8), the position aligned to 16 (to 32), the
+        // distances again in signature order (to 40).
+        let v = [out("SV_Position", 3, 4), out("SV_ClipDistance", 6, 2)];
+        assert_eq!(metal_mesh_output_bytes(&v, &[], 1, 0), 40);
+        // Primitives: their own layout (4, then 8 aligned: 16) times their
+        // maximum.
+        let p = [out("SV_PrimitiveID", 10, 1), out("TEXCOORD", 0, 2)];
+        assert_eq!(metal_mesh_output_bytes(&[], &p, 0, 3), 3 * 16);
+    }
+
+    /// The case of pragyaangaur/VIctory-macOS issue #172: exactly 32 KiB by
+    /// the packed count, over by Metal's layout.
+    #[test]
+    fn a_mesh_under_the_packed_count_can_be_over_metal_layout() {
+        // Per vertex: the position, six float3 and a float (92 bytes
+        // packed, 100 aligned); per primitive: float, float3, float,
+        // float3, float (36 packed, 52 aligned).
+        let mut v = vec![out("SV_Position", 3, 4)];
+        v.extend((0..6).map(|_| out("TEXCOORD", 0, 3)));
+        v.push(out("TEXCOORD", 0, 1));
+        let p = [1, 3, 1, 3, 1].map(|n| out("TEXCOORD", 0, n));
+        assert_eq!(mesh_output_bytes(&v, &p, 256, 256), MESH_OUTPUT_LIMIT);
+        assert_eq!(metal_mesh_output_bytes(&v, &p, 256, 256), 256 * 100 + 256 * 52);
+        assert!(metal_mesh_output_bytes(&v, &p, 256, 256) > MESH_OUTPUT_LIMIT);
+        // At 128 lanes both fit.
+        assert!(metal_mesh_output_bytes(&v, &p, 128, 128) <= MESH_OUTPUT_LIMIT);
     }
 
     fn el(name: &str, kind: u8, comp: u8, interp: u8, row: u32, col: u8, usage: u8) -> SigElement {

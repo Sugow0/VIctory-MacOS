@@ -1441,12 +1441,77 @@ pub fn set_host_max_wave(lanes: u32) {
 }
 
 thread_local! {
+    /// See [`keep_wave_why`].
+    static WAVE_WHY: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keeps this thread's wave64 diagnostics (the `WAVE64-WHY`, `WAVE64-RETRY`
+/// and `WAVE64-WIDE` lines `VICTORY_WAVE_WHY=1` prints) from now on, for
+/// [`take_wave_why`], whether that variable is set or not: the offline
+/// `translate --list` puts them next to the program they are about.
+pub fn keep_wave_why() {
+    WAVE_WHY.with_borrow_mut(|w| {
+        w.get_or_insert_with(Vec::new);
+    });
+}
+
+/// The wave64 diagnostics kept on this thread since the last call (none
+/// unless [`keep_wave_why`] was called).
+pub fn take_wave_why() -> Vec<String> {
+    WAVE_WHY.with_borrow_mut(|w| w.as_mut().map(std::mem::take).unwrap_or_default())
+}
+
+/// Whether wave64 diagnostics are asked for: printed (`VICTORY_WAVE_WHY`)
+/// or kept ([`keep_wave_why`]).
+pub(super) fn wave_why_on() -> bool {
+    std::env::var_os("VICTORY_WAVE_WHY").is_some() || WAVE_WHY.with_borrow(Option::is_some)
+}
+
+/// One wave64 diagnostic: printed with `VICTORY_WAVE_WHY`, kept with
+/// [`keep_wave_why`].
+pub(super) fn wave_why(line: String) {
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        eprintln!("{line}");
+    }
+    WAVE_WHY.with_borrow_mut(|w| {
+        if let Some(w) = w {
+            w.push(line);
+        }
+    });
+}
+
+#[cfg(test)]
+mod wave_why_tests {
+    /// Diagnostics are kept only once asked for, per thread, in the order
+    /// made, and each take empties the log.
+    #[test]
+    fn wave64_diagnostics_are_kept_per_thread_once_asked_for() {
+        std::thread::spawn(|| {
+            super::wave_why("WAVE64-WHY before".into());
+            assert!(super::take_wave_why().is_empty(), "kept without being asked for");
+            super::keep_wave_why();
+            assert!(super::wave_why_on());
+            super::wave_why("WAVE64-WHY one".into());
+            super::wave_why("WAVE64-RETRY two".into());
+            // (another thread keeps its own, here none)
+            std::thread::spawn(|| {
+                super::wave_why("WAVE64-WHY elsewhere".into());
+                assert!(super::take_wave_why().is_empty());
+            })
+            .join()
+            .unwrap();
+            assert_eq!(super::take_wave_why(), ["WAVE64-WHY one", "WAVE64-RETRY two"]);
+            assert!(super::take_wave_why().is_empty(), "a take empties the log");
+        })
+        .join()
+        .unwrap();
+    }
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1517,14 +1582,77 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 5] {
+pub fn host_settings() -> [u32; 6] {
     [
         host_max_wave(),
         super::shader::view_heap_limit(),
         super::shader::raw_views(),
         host_rdna(),
         u32::from(host_derived_vertices()),
+        u32::from(host_metal_mesh_limit()),
     ]
+}
+
+static HOST_METAL_MESH_LIMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator that the host is D3DMetal, where a mesh pipeline
+/// whose outputs pass 32 KiB by Metal's aligned layout is made and then
+/// hangs the queue (docs/macos.md): such mesh shaders are refused
+/// ([`mesh_outputs_fit`]). Ported from pragyaangaur/VIctory-macOS PR #282.
+pub fn set_host_metal_mesh_limit(on: bool) {
+    HOST_METAL_MESH_LIMIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_metal_mesh_limit`], for its thread only.
+    pub(super) static TEST_METAL_MESH_LIMIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// See [`set_host_metal_mesh_limit`].
+pub(super) fn host_metal_mesh_limit() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_METAL_MESH_LIMIT.get() {
+        return on;
+    }
+    HOST_METAL_MESH_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `VICTORY_MESH_OVER_LIMIT=1`: on D3DMetal, mesh shaders over Metal's
+/// 32 KiB are translated anyway (they hang the queue there).
+fn mesh_over_limit_allowed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_OVER_LIMIT").is_some_and(|v| v != "0"))
+}
+
+/// Whether a mesh shader's outputs at the maxima fit the host's 32 KiB:
+/// by D3D12's count ([`container::mesh_output_bytes`]), and with `metal`
+/// (D3DMetal) also by Metal's aligned layout
+/// ([`container::metal_mesh_output_bytes`]), the larger of the two as in
+/// pragyaangaur/VIctory-macOS PR #282. Pure, for testing.
+pub(super) fn mesh_outputs_fit(
+    vertex: &[super::container::SigElement],
+    primitive: &[super::container::SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+    metal: bool,
+) -> bool {
+    use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes, metal_mesh_output_bytes};
+    let packed = mesh_output_bytes(vertex, primitive, max_vertices, max_primitives);
+    let aligned = if metal {
+        metal_mesh_output_bytes(vertex, primitive, max_vertices, max_primitives)
+    } else {
+        0
+    };
+    packed.max(aligned) <= MESH_OUTPUT_LIMIT
+}
+
+/// Whether a mesh shader still over the limit at the lane count is refused:
+/// with `VICTORY_MESH_OUTPUT_STRICT` (`strict`) anywhere; on D3DMetal
+/// (`metal`) unless `VICTORY_MESH_OVER_LIMIT=1` (`over_limit`). Pure, for
+/// testing.
+pub(super) fn refuse_mesh_over_limit(strict: bool, metal: bool, over_limit: bool) -> bool {
+    strict || (metal && !over_limit)
 }
 
 static HOST_DERIVED_VERTICES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1939,7 +2067,7 @@ impl<'a> Lower<'a> {
                     }
                 }
                 // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
-                if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                if wave == 64 && wave_why_on() {
                     let mut why: Vec<&str> = Vec::new();
                     for i in insts() {
                         let n = i.name();
@@ -1974,7 +2102,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                     why.sort_unstable();
-                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                    wave_why(format!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", ")));
                 }
             }
             if wave == 32 && x.native.wave64 {
@@ -5230,19 +5358,24 @@ impl<'a> Lower<'a> {
         // writes only vertex n and primitive n, so maxima past the lanes are
         // never reached: they come down to the lane count when the outputs
         // do not fit.
-        use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
+        // On D3DMetal the outputs must also fit by Metal's aligned layout:
+        // a pipeline over it there is made, draws nothing and its submission
+        // never completes (pragyaangaur/VIctory-macOS #172, PR #282).
         let (outputs, prims) = (&self.s.outputs, &self.s.prims);
+        let metal = host_metal_mesh_limit();
         let fits = |m: super::shader::Mesh| {
-            mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
+            mesh_outputs_fit(outputs, prims, m.max_vertices, m.max_primitives, metal)
         };
         if !fits(mesh) {
             mesh.max_vertices = mesh.max_vertices.min(threads);
             mesh.max_primitives = mesh.max_primitives.min(threads);
             // shortcut: outputs past the cap even at the lane count are
-            // still emitted with the lower maxima (drivers take them);
-            // refuse them here if one hangs.
-            // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
+            // still emitted with the lower maxima (Windows drivers take
+            // them). Refused with `VICTORY_MESH_OUTPUT_STRICT=1`, and on
+            // D3DMetal unless `VICTORY_MESH_OVER_LIMIT=1`: the pipeline is
+            // not made and its draws are dropped, the queue keeps running.
+            let strict = std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some();
+            if !fits(mesh) && refuse_mesh_over_limit(strict, metal, mesh_over_limit_allowed()) {
                 return Err("a mesh shader whose outputs pass the host's 32 KiB");
             }
             self.s.mesh = Some(mesh);
@@ -14325,5 +14458,54 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    fn mesh_out(kind: u8, cols: u8) -> crate::emit::container::SigElement {
+        crate::emit::container::SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 2,
+            row: Some(0),
+            col: 0,
+            cols,
+            usage: 1,
+            half: false,
+        }
+    }
+
+    /// pragyaangaur/VIctory-macOS PR #282's rule: on D3DMetal the larger of
+    /// the packed count and Metal's aligned layout must fit 32 KiB; elsewhere
+    /// the packed count alone, as before.
+    #[test]
+    fn mesh_outputs_fit_by_metal_layout_on_d3dmetal_only() {
+        use super::mesh_outputs_fit;
+        // 32 KiB packed, 38,912 bytes aligned (container's test).
+        let mut v = vec![mesh_out(3, 4)];
+        v.extend((0..6).map(|_| mesh_out(0, 3)));
+        v.push(mesh_out(0, 1));
+        let p = [1, 3, 1, 3, 1].map(|n| mesh_out(0, n));
+        assert!(mesh_outputs_fit(&v, &p, 256, 256, false), "Windows: unchanged");
+        assert!(!mesh_outputs_fit(&v, &p, 256, 256, true), "D3DMetal: over");
+        // At the lane count it fits both ways.
+        assert!(mesh_outputs_fit(&v, &p, 128, 128, true));
+        // Over by the packed count: over everywhere.
+        let wide: Vec<_> = (0..40).map(|_| mesh_out(0, 4)).collect();
+        assert!(!mesh_outputs_fit(&wide, &[], 256, 0, false));
+        assert!(!mesh_outputs_fit(&wide, &[], 256, 0, true));
+    }
+
+    #[test]
+    fn mesh_over_limit_is_refused_on_d3dmetal_unless_allowed() {
+        use super::refuse_mesh_over_limit;
+        // Windows: only with VICTORY_MESH_OUTPUT_STRICT, as before.
+        assert!(!refuse_mesh_over_limit(false, false, false));
+        assert!(!refuse_mesh_over_limit(false, false, true));
+        assert!(refuse_mesh_over_limit(true, false, false));
+        // D3DMetal: refused unless VICTORY_MESH_OVER_LIMIT=1.
+        assert!(refuse_mesh_over_limit(false, true, false));
+        assert!(!refuse_mesh_over_limit(false, true, true));
+        assert!(refuse_mesh_over_limit(true, true, true), "strict still wins");
     }
 }

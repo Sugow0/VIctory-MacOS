@@ -82,6 +82,8 @@ enum Command {
     /// VICTORY_HOST_MAX_WAVE is a compatibility alias. When both values are
     /// valid, VICTORY_HOST_WAVE takes precedence. Zero means unknown width.
     /// For ordinary translation, VICTORY_HOST_RDNA=1 selects RDNA float settings.
+    /// VICTORY_HOST_D3DMETAL=1 translates as on D3DMetal (with VICTORY_HOST_WAVE=32);
+    /// --list then also lists why refused wave64 programs keep 64 lanes.
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -218,6 +220,13 @@ fn main() -> Result<()> {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
+            }
+            // `VICTORY_HOST_D3DMETAL=1`: translate as `run` does on D3DMetal (with
+            // `VICTORY_HOST_WAVE=32`, its wave width): pixel attributes read per vertex
+            // derived, mesh shaders over Metal's limit refused (docs/macos.md)
+            if std::env::var_os("VICTORY_HOST_D3DMETAL").is_some_and(|v| v == "1") {
+                victory_shader::emit::set_host_derived_vertices(true);
+                victory_shader::emit::set_host_metal_mesh_limit(true);
             }
             let wave = translate::host_wave::select(
                 std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
