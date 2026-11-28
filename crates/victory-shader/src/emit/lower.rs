@@ -30,6 +30,9 @@ pub(super) mod intersect;
 #[path = "literal.rs"]
 pub(super) mod literal;
 
+#[path = "lds_step.rs"]
+mod lds_step;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -1110,6 +1113,13 @@ fn meeting_mode() -> u32 {
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+    lds_meetings_with(p, st, all, std::env::var_os("VICTORY_LDS_WAR").is_some_and(|v| v == "1"))
+}
+
+/// [`lds_meetings`]; `war`: a region whose LDS reads all come before its writes is taken too
+/// (`lds_step::read_after_write`). shortcut, off unless `VICTORY_LDS_WAR=1`: whole-wave flow
+/// ([`literal`]) runs the programs that needed it with every lane in every block.
+fn lds_meetings_with(p: &crate::ir::Program, st: &Structured, all: &[bool], war: bool) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -1158,9 +1168,13 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // A region that reads and writes LDS is still taken when it only raises flags
     // (`lds_flag_region`): a read that misses the other host wave's write changes nothing
     // the region leaves behind.
+    // So is one whose reads all come before its writes, with `war`.
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        if war && !lds_step::read_after_write(p, st, &blocks) {
+            continue;
+        }
         if !(flags_on && lds_flag_region(p, st, &blocks)) {
             return None;
         }
@@ -1178,6 +1192,27 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     Some(meet)
+}
+
+/// The blocks where the two host waves of each console wave can meet for LDS
+/// ([`lds_step::in_step`]); `all` ([`all_lane_blocks`]) with an indirect exit. `exchanged`:
+/// a group of one console wave whose halves exchange, where the translation gives scalars the
+/// console's values, except those it takes per host wave (a waterfall loop's first-lane
+/// reads, and the loops over a lane's own bits, [`super::own_bits`]).
+fn lds_in_step(p: &Program, x: &Parts<'_>, all: &[bool], cs: &crate::native::ComputeIo, exchanged: bool) -> Vec<bool> {
+    let exact = (exchanged && !LOCAL_WAVES.get()).then(|| {
+        // (whole-wave flow takes no loop over a lane's own bits per host wave)
+        let own = if own_bits_on() && !x.st.literal { super::own_bits::find(p, x.st, false) } else { Default::default() };
+        let mut per_wave: HashSet<Value> = x.res.waterfall.reads.iter().copied().collect();
+        per_wave.extend(own.totals.iter().copied());
+        for i in p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == "v_readfirstlane_b32") {
+            if i.reads.iter().any(|(r, v)| matches!(r, Reg::V(_)) && own.alike.contains(v)) {
+                per_wave.extend(i.writes.iter().map(|w| w.1));
+            }
+        }
+        per_wave
+    });
+    lds_step::in_step(p, x.st, cs.system_sgprs().1, exact.as_ref()).unwrap_or_else(|| all.to_vec())
 }
 
 /// Whether a lane-branch region (`blocks`, see [`lds_meetings`]) that both reads and writes
@@ -1996,21 +2031,26 @@ impl<'a> Lower<'a> {
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
                     if let Some(all) = all_lane_blocks_with(x.st, true) {
+                        // The barriers go only where every thread of the group gets there
+                        // together, the same number of times (`lds_step::in_step`): not in a
+                        // loop whose exit is per lane, nor behind a scalar branch the host
+                        // waves may decide apart (pragyaangaur/VIctory-macOS PR #370).
+                        let step = lds_in_step(p, x, &all, &cs, crosses && group <= 64);
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
-                                !lds(inst) || all.get(b).copied().unwrap_or(false)
+                                !lds(inst) || step.get(b).copied().unwrap_or(false)
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
-                            lds_meet = Some((all.clone(), meet));
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &step) {
+                            lds_meet = Some((step.clone(), meet));
                             lds_ok = true;
                         }
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
                             // branches around them taken wave-wide they get their barriers)
                             for (b, blk) in p.blocks.iter().enumerate() {
-                                if !all.get(b).copied().unwrap_or(false) && blk.insts.iter().any(lds) {
+                                if !step.get(b).copied().unwrap_or(false) && blk.insts.iter().any(lds) {
                                     need(b);
                                 }
                             }
@@ -2056,10 +2096,12 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks_with(x.st, true) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
-                                why.push("an LDS read and write in one lane-branch region")
+                            Some(all) => {
+                                let step = lds_in_step(p, x, &all, &cs, crosses && group <= 64);
+                                if lds_meetings(p, x.st, &step).is_none() {
+                                    why.push("an LDS read and write in one lane-branch region")
+                                }
                             }
-                            Some(_) => {}
                         }
                     }
                     why.sort_unstable();

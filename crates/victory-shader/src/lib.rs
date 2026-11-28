@@ -36,7 +36,11 @@ pub mod structure;
 /// branches (`widen`) an earlier build may have cached, and a loop's own branch block is no
 /// longer taken as every lane's there. (Another branch bumping too: take the next number
 /// past both on merge.)
-pub const TRANSLATOR_VERSION: u32 = 3;
+/// 4 (fix/wave64-lds-in-step): the group barriers of a console wave64 program's LDS on a host
+/// of 32-lane waves stand only in blocks every thread runs together, the same number of times
+/// (`emit/lds_step.rs`): programs that had them in a loop with a per-lane exit or behind a
+/// scalar branch the host waves may decide apart are translated differently.
+pub const TRANSLATOR_VERSION: u32 = 4;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
