@@ -34,6 +34,36 @@ D3DMetal do with victory.exe is not. Known risks:
   `wine_get_version`) and commits sections whole there; whether Wine on
   macOS (16 KiB host pages) implements placeholders and write watching
   with 4 KiB dirty bits and 64 KiB views is unknown.
+- **Masked stores under Rosetta** (`VICTORY_PATCH_MASKED`). Rosetta 2 runs
+  an AVX masked store (`vpmaskmovd`/`q`, `vmaskmovps`/`pd`) one element at
+  a time and can resume a write fault only on the first one; a fault on a
+  later element stops the process with "rosetta error: unexpectedly need to
+  EmulateForward on a synchronous exception" and it hangs. The title's
+  stores fault on the pages Wine's `MEM_WRITE_WATCH` emulation and our view
+  guards (`watch.rs`) make read-only; two of them hung our runs (title RVA
+  0x1D6F0A2, `vpmaskmovd [rax]`, and 0x79D67, `vpmaskmovd [rax+rdx*4]`).
+  So under Wine the loader scans the executable sections of the title and
+  of its DLLs for them (and for `vcvtps2ph`, `vextractf128` and
+  `vextracti128` to memory), and turns each into a 5-byte jump to a
+  trampoline near the image that writes the enabled lanes with plain `mov`s,
+  keeping every register and the flags
+  (`crates/victory-loader/src/masked.rs`, ported from
+  pragyaangaur/VIctory-macOS). One log line per image gives the stores found
+  by kind, patched and skipped. It runs after the other load-time patches;
+  a store whose bytes in memory are no longer the file's, or that overlaps
+  another match, is left alone. `VICTORY_PATCH_MASKED=all` patches every
+  store found, `none` (or `0`) none, and a comma list of hex RVAs of the
+  executable only those (`all,<rva>` both; an RVA the scan did not find is
+  decoded as an unaligned 256-bit `vmovups`/`vmovupd`/`vmovdqu` store and
+  redone the same way). Unset, it is `all` under Wine and `none` on Windows.
+  A byte match is kept only if walking its `.pdata` function (or, for a
+  leaf function, the gap from the previous function's end) with a length
+  decoder lands on it with the store's length and no legacy prefix; the
+  rest are counted in the log line. In Series 1.0.2.1's executable that
+  keeps 1233 of the 1234 matches (the other is the immediate of a
+  `mov eax, imm32` at RVA 0x2D566D4). A trampoline has no unwind
+  data: an exception raised inside one that reaches a frame-based handler
+  unwinds wrongly.
 - **FXC.** A few host shaders are compiled at run time with `D3DCompile`
   (`inplace.rs`, `host.rs`), which needs `d3dcompiler_47.dll` in the prefix.
   Wine's builtin (vkd3d) refuses 8 of them, so Microsoft's is put in the
