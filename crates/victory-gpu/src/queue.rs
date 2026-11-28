@@ -192,6 +192,10 @@ fn submit_cut(this: This, lists: &[This]) {
         {
             let mut held = lock(&queue(this).held);
             for (waits, taken, order) in parts {
+                if crate::valuetrace::on() {
+                    let ids = taken.iter().map(|l| l.host().trace_id());
+                    crate::valuetrace::staged(ids, Some(this as usize), crate::valuetrace::Stage::Held);
+                }
                 held.extend(waits.into_iter().map(Held::Value));
                 held.push(Held::Run(taken, order));
             }
@@ -274,6 +278,10 @@ fn submit_split(this: This, lists: &[This]) {
             let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
             pieces.extend(waits.into_iter().map(Held::Value));
             let (taken, order) = crate::list::detach(&lists[from..to]);
+            if crate::valuetrace::on() {
+                let ids = taken.iter().map(|l| l.host().trace_id());
+                crate::valuetrace::staged(ids, Some(this as usize), crate::valuetrace::Stage::Held);
+            }
             pieces.push(Held::Run(taken, order));
             from = to;
         }
@@ -337,23 +345,41 @@ pub(crate) fn release_held(all: bool) {
                     {
                         break;
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(Held::Value(wait)) if !all && !value_met(wait) => {
+                        crate::valuetrace::standing(q, wait, true);
+                        break;
+                    }
                     Some(_) => {}
                 }
                 match held.remove(0) {
                     Held::Wait(..) => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
-                        // queue stood at.
+                        // queue stood at (per address: the first 8, then
+                        // every power of two; with `VICTORY_TRACE_VALUES=1`
+                        // what became of the write it waits for).
                         if all && !value_met(&wait) {
-                            static SEEN: AtomicU64 = AtomicU64::new(0);
-                            if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
-                                tracing::warn!(
-                                    queue = format_args!("{q:#x}"),
-                                    ?wait,
-                                    "a wait for a memory value was not met at a present: the queue runs on"
-                                );
-                            }
+                            crate::valuetrace::unmet_at_present(q, &wait, &|other| {
+                                if other == q {
+                                    return describe_held(&held);
+                                }
+                                // (`WAITING` held throughout: `release`
+                                // frees a queue only under it.)
+                                let waiting = lock(&WAITING);
+                                if !waiting.contains(&other) {
+                                    return "nothing".into();
+                                }
+                                // SAFETY: a live queue: it is in `WAITING`.
+                                let theirs = unsafe { &(*(other as *const Queue)).held };
+                                let told = match theirs.try_lock() {
+                                    Ok(theirs) => describe_held(&theirs),
+                                    Err(_) => "(its line is being looked at)".into(),
+                                };
+                                drop(waiting);
+                                told
+                            });
+                        } else {
+                            crate::valuetrace::standing(q, &wait, false);
                         }
                     }
                     Held::Run(lists, order) => {
@@ -430,6 +456,21 @@ pub(crate) fn release_held(all: bool) {
             break;
         }
     }
+}
+
+/// What a queue holds, first of all, in words (`crate::valuetrace`).
+#[cfg(windows)]
+fn describe_held(held: &[Held]) -> String {
+    let first = match held.first() {
+        None => return "nothing".into(),
+        Some(&Held::Wait(fence, value)) => {
+            format!("a wait for fence {fence:#x} to reach {value} (it is at {})", crate::fence::completed(fence as This))
+        }
+        Some(Held::Value(wait)) => format!("a wait for a memory value {wait:?} (met in memory: {})", wait.met()),
+        Some(Held::Run(_, order)) => format!("a submission of {} lists", order.len()),
+        Some(&Held::Signal(fence, value)) => format!("a signal of fence {fence:#x} to {value}"),
+    };
+    format!("{first}, of {} things held", held.len())
 }
 
 /// Before a submission of ours that is waited for, or a wait for flights by
@@ -555,10 +596,14 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
+    // (Under the lock of `WAITING`: whoever holds it and finds the queue
+    // there may look at it, so it is not freed before it is taken off.)
+    #[cfg(windows)]
+    let mut waiting = lock(&WAITING);
     let left = object::release_boxed::<Queue>(this);
     #[cfg(windows)]
     if left == 0 {
-        lock(&WAITING).retain(|&q| q != this as usize);
+        waiting.retain(|&q| q != this as usize);
     }
     left
 }
@@ -576,6 +621,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if crate::valuetrace::on() && !this.is_null() {
+            crate::valuetrace::staged(crate::list::trace_ids(lists), Some(this as usize), crate::valuetrace::Stage::Submitted);
+        }
         if behind::on() && !this.is_null() {
             behind::submit(this, lists);
             return;
@@ -850,6 +898,9 @@ impl Written {
         };
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::timeline::told("written when its list had run", at as usize, value);
+        if crate::valuetrace::on() {
+            crate::valuetrace::landed(at as u64, bytes, value);
+        }
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {

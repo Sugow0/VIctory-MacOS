@@ -306,6 +306,23 @@ wine64 target/x86_64-pc-windows-msvc/diag/victory.exe warm --used
 
 To pick an adapter, as on Windows: `--more VICTORY_D3D12_ADAPTER=<index or name>`.
 
+## Tracing waits for memory values
+
+When the title stands on its loading screen with queues waiting for a value a
+list writes at the bottom of the pipe (the log's "a wait for a memory value was
+not met at a present"), `--more VICTORY_TRACE_VALUES=1` (off by default; read
+in `crates/victory-gpu/src/valuetrace.rs`) books every such write by address:
+the value, the title list and host list that wrote it, when it was recorded
+and when it reached title memory, and where that host list is (submitted, held
+by its queue, in the submitting thread's line, running, in flight, landed).
+Each wait passed at a present without being met is then told with the value in
+memory now, that last write, what the queue holding its list stands at first,
+and whether the flights in the air are known to meet it. Those warnings are
+limited per address (the first 8, then every power of two), with or without
+the switch. Every 5 s while a queue has stood at a wait for more than a
+second, one line per wait it stands at gives the queue, the address, the
+reference, the value in memory and how long it has stood there.
+
 ## Verifying a merge
 
 After upstream is merged into `port-macos`, one command checks a commit on
