@@ -443,6 +443,9 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
+    /// Whole-wave ("literal") control flow ([`structure_literal`]): every per-lane branch is
+    /// in [`Self::wide`], so every lane of the console wave runs every block.
+    pub literal: bool,
 }
 
 impl Structured {
@@ -485,6 +488,60 @@ pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Struct
         l.derived_phis.extend(new_derived);
         l.reset();
     }
+}
+
+/// The whole-wave ("literal") form of `program`: every branch whose condition depends on the
+/// lane is taken as the console takes it, by the whole wave at once ([`structure_wide`] with
+/// all of them), so every lane runs every block and EXEC stays a guard on each vector
+/// instruction, as on the console. For a console wave run as two host waves of 32 lanes: the
+/// halves then follow the same blocks together, and each cross-lane operation, vote or group
+/// barrier between them stands where both arrive.
+///
+/// Ported from pragyaangaur/VIctory-macOS #435 (`structure::split_literal`, whole-wave control
+/// flow for 64-thread wave64 groups), onto this translator's wave-wide branches; its #591 (a
+/// while-shaped loop run in lockstep) follows here, as every loop exit is a whole-wave vote.
+pub fn structure_literal(program: &Program) -> Result<Structured, ShaderError> {
+    const UNKNOWN: ShaderError = ShaderError::Unsupported {
+        offset: 0,
+        what: "a lane branch with no whole-wave meaning (whole-wave flow)",
+    };
+    let mut wide = HashSet::new();
+    // Taking a branch wave-wide forgets what it told a lane about its own bits, which can
+    // leave later branches depending on the lane: to a fixpoint.
+    for _ in 0..=program.blocks.len() {
+        let mut st = structure_wide(program, &wide)?;
+        let more: Vec<usize> = st
+            .exits
+            .iter()
+            .enumerate()
+            .filter(|&(b, e)| match *e {
+                LaneExit::Branch { when, taken, not_taken } => {
+                    taken != not_taken
+                        && !wide.contains(&b)
+                        && !st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+                }
+                _ => false,
+            })
+            .map(|(b, _)| b)
+            .collect();
+        if more.is_empty() {
+            if st.wide.iter().any(|&b| st.wave_any[b].is_none()) {
+                return Err(UNKNOWN);
+            }
+            // `v_writelane_b32` writes its lane whatever EXEC holds (#435).
+            for (b, block) in program.blocks.iter().enumerate() {
+                for (i, inst) in block.insts.iter().enumerate() {
+                    if inst.name() == "v_writelane_b32" {
+                        st.guards[b][i] = None;
+                    }
+                }
+            }
+            st.literal = true;
+            return Ok(st);
+        }
+        wide.extend(more);
+    }
+    Err(UNKNOWN)
 }
 
 /// A lane mask by the values of its low and high dword (both the low one in
@@ -860,6 +917,7 @@ impl<'a> Lanes<'a> {
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             wide: self.wide,
+            literal: false,
             wave_any: self.wave_any,
             scc_some: self
                 .scc_lane

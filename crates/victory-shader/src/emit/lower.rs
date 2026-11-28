@@ -25,6 +25,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// Whole-wave ("literal") control flow for a console wave64 program run as two host waves of
+/// 32 (after pragyaangaur/VIctory-macOS #435, #591, #593), a child module for the same reason.
+#[path = "literal.rs"]
+pub(super) mod literal;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -65,6 +70,10 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Each waiting group barrier made, in order: the IR block being lowered, and whether it
+    /// stood inside guarded code ([`literal`]).
+    #[cfg(test)]
+    pub barriers: Vec<(usize, bool)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -397,6 +406,12 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Guarded code ([`Self::begin_guarded`]) open around what is being lowered, and whether a
+    /// group barrier was made inside some: whole-wave flow refuses that ([`literal`]).
+    guarded_depth: u32,
+    barrier_guarded: bool,
+    #[cfg(test)]
+    barriers: Vec<(usize, bool)>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -441,9 +456,16 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+    all_lane_blocks_with(st, false)
+}
+
+/// [`all_lane_blocks`]; `loops`: a loop's own branch block counts as one only some lanes run
+/// ([`lane_regions`]). For two host waves of 32 that exchange (a console wave64 program on a
+/// 32-lane host) only, so other hosts keep their translations.
+fn all_lane_blocks_with(st: &Structured, loops: bool) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
-    for (_, region) in lane_regions(st)? {
+    for (_, region) in lane_regions(st, loops)? {
         for b in (0..n).filter(|&b| region[b]) {
             all[b] = false;
         }
@@ -454,7 +476,8 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+/// `loops`: the branch's own block is in its region where the branch closes a loop.
+fn lane_regions(st: &Structured, loops: bool) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -498,11 +521,14 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }
-        // blocks reachable from the lane branch that do not post-dominate it
+        // blocks reachable from the lane branch that do not post-dominate it; with `loops`,
+        // that do not strictly post-dominate it: the branch's own block too where it closes a
+        // loop (a do-while's latch, a while loop's test), whose later passes only the lanes
+        // that stay run (two exchanging host waves would part around a barrier there)
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+            if seen[b] || (!loops || b != d) && pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }
             seen[b] = true;
@@ -519,7 +545,7 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 /// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
 pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
     let mut out = Vec::new();
-    for (d, region) in lane_regions(st)? {
+    for (d, region) in lane_regions(st, false)? {
         if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
             st.wave_any.get(d).copied().flatten()?;
             out.push(d);
@@ -569,7 +595,7 @@ fn lane_uniform(
 ) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let order = crate::ir::reverse_postorder(&p.blocks);
-    let regions = lane_regions(st);
+    let regions = lane_regions(st, true);
     let mut same: HashSet<Value> = HashSet::new();
     loop {
         // An atom of a lane condition that every lane of a console wave holds alike.
@@ -1969,7 +1995,7 @@ impl<'a> Lower<'a> {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    if let Some(all) = all_lane_blocks_with(x.st, true) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -2028,7 +2054,7 @@ impl<'a> Lower<'a> {
                     }
                     if s.lds_dwords > 0 && group > 32 {
                         why.push("LDS in a group over 32");
-                        match all_lane_blocks(x.st) {
+                        match all_lane_blocks_with(x.st, true) {
                             None => why.push("an indirect exit"),
                             Some(all) if lds_meetings(p, x.st, &all).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
@@ -2070,7 +2096,9 @@ impl<'a> Lower<'a> {
                 .iter()
                 .enumerate()
                 .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
-            let all = all_lane_blocks(x.st);
+            // (a console wave64 program in host waves of 32: a loop's own branch block is not
+            // every lane's, as for its LDS and exchanges above; other hosts as before)
+            let all = all_lane_blocks_with(x.st, halves.is_some());
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
                 .filter(|&b| {
@@ -2204,7 +2232,9 @@ impl<'a> Lower<'a> {
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
-                Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
+                // (not in whole-wave flow: each host wave would loop over its own bits, and the
+                // halves would part around the barriers inside)
+                Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() && !x.st.literal => {
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
                 }
                 _ => Default::default(),
@@ -2245,6 +2275,10 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            guarded_depth: 0,
+            barrier_guarded: false,
+            #[cfg(test)]
+            barriers: Vec::new(),
         }
     }
 
@@ -2891,6 +2925,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.literal_checks().map_err(|w| unsupported(0, w))?;
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -2947,6 +2982,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.barrier_guarded {
+            return Err(unsupported(0, literal::BARRIER_GUARDED));
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2964,6 +3002,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            barriers: std::mem::take(&mut self.barriers),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4802,6 +4842,7 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        self.note_barrier();
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -5173,8 +5214,13 @@ impl<'a> Lower<'a> {
         let g = guard?;
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
+        self.guarded_depth += 1;
         let head = self.cur;
         self.cur = then;
+        #[cfg(test)]
+        if literal::INJECT_GUARDED_BARRIER.get() {
+            self.group_sync(then);
+        }
         Some((head, join))
     }
 
@@ -5183,6 +5229,7 @@ impl<'a> Lower<'a> {
         let Some((head, join)) = at else {
             return values.iter().map(|v| v.0).collect();
         };
+        self.guarded_depth = self.guarded_depth.saturating_sub(1);
         let then = self.cur;
         self.s.m.terminate(then, Term::Br(join));
         self.cur = join;
@@ -6017,6 +6064,7 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
+            self.note_barrier();
             let mode = self.s.m.i32(meeting_mode());
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -6049,6 +6097,9 @@ impl<'a> Lower<'a> {
                 };
                 if !waits {
                     mode &= !1;
+                }
+                if waits {
+                    self.note_barrier();
                 }
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
@@ -6101,6 +6152,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
+        self.note_barrier();
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -13409,6 +13461,11 @@ impl<'a> Lower<'a> {
                 // A back edge is taken only below the iteration limit.
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
+                if self.x.st.literal && taken != not_taken && back(self, taken) && back(self, not_taken) {
+                    let term = self.two_back_edges(b, cond, taken, not_taken);
+                    self.s.m.terminate(self.cur, term);
+                    return Ok(());
+                }
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
                 let cond = if back(self, taken) {
