@@ -77,7 +77,9 @@ What the runtime chooses from a capability it reports:
   (`lower::with_wave64_approx`): each half computes its own cross-lane
   results (a wave-wide sum becomes two half-wave ones), LDS the console
   shares within its wave goes without the other half's order, and no
-  barrier is added (nor LDS for an exchange). It respects
+  barrier is added for LDS or in a branch (only the entry block's one, where
+  every split into waves of 32 numbers its host waves), nor LDS for an
+  exchange. It respects
   `VICTORY_WAVE_LOCAL=0` and `VICTORY_WAVE_LOCAL=idiom` (both leave such
   programs refused), and does not take a program refused at a lane mask
   with lanes elsewhere, which only the exact forms help. Each such program

@@ -15,14 +15,22 @@ const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
     [0x36 << 26 | (op as u32) << 18, (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32]
 }
 
-/// One console wave of 64 threads with 512 bytes of LDS (wave64_tests' `flag_program(Some(2))`):
+/// A group of 128 threads (two console waves) with 512 bytes of LDS, after wave64_tests'
+/// `flag_program(Some(2))`, reading its console lane (`v_mbcnt`, which needs 64-lane waves;
+/// a group of one console wave now takes whole-wave flow, `literal`):
 /// the threads below s0 raise an LDS flag, read it back and write a second value inside their
 /// branch, so the two host waves would have to share LDS in a lane branch, and a scalar the
 /// branch sets is read after it: no form fits that.
 /// Without `scalar` the skip around the branch can be left out, and the program translates
 /// exactly, in two waves of 32 with a group barrier before every LDS access.
 fn program(scalar: bool) -> NativeProgram {
-    let mut body = vec![0x7E12_0280]; // v_mov_b32 v9, 0
+    let mut body = vec![
+        0xD765_000A,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v10, -1, 0
+        0xD766_000A,
+        0x0002_14C1, // v_mbcnt_hi_u32_b32 v10, -1, v10 (the console lane: 64-lane waves)
+        0x7E12_0280, // v_mov_b32 v9, 0
+    ];
     body.extend_from_slice(&ds(DS_WRITE_B32, 0, 9, 9));
     // (a scalar the branch changes and the code after it reads keeps its skip in every form)
     body.push(0xBE94_0380); // s_mov_b32 s20, 0
@@ -47,6 +55,7 @@ fn program(scalar: bool) -> NativeProgram {
     body.extend_from_slice(&[
         0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
         0x4A0A_0A14, // v_add_nc_u32 v5, s20, v5
+        0x4A0A_0B0A, // v_add_nc_u32 v5, v10, v5
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
         0x38 << 26 | 0x1C << 18 | 1 << 12,
         0x80 << 24 | 2 << 16 | 5 << 8 | 1, // buffer_store_dword v5, v1, s[8:11], 0 offen
@@ -76,7 +85,7 @@ fn program(scalar: bool) -> NativeProgram {
             user_data: 4,
             slot: 1,
         }],
-        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | 1 << 15, threads: [64, 1, 1] }),
+        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | 1 << 15, threads: [128, 1, 1] }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     }
 }
@@ -144,9 +153,11 @@ fn an_approximate_translation_adds_no_barrier() {
     let approx_barriers = barriers(&approx);
     super::bitcode::census::COUNT_HERE.set(was);
     assert_eq!(super::wanted_wave(&exact.dxil), Some(32));
-    assert!(exact_barriers > 0, "no barrier counted in the exact form");
-    // the console program has no `s_barrier`: none at all
-    assert_eq!(approx_barriers, 0);
+    assert!(exact_barriers > 1, "no LDS barrier counted in the exact form");
+    // the console program has no `s_barrier`: only the entry block's, where every thread of
+    // the group meets once to number the host waves (`wave_base`, in every split into waves
+    // of 32, before any branch), and none for LDS or in a branch
+    assert_eq!(approx_barriers, 1);
 }
 
 #[test]
