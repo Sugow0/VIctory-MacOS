@@ -126,6 +126,21 @@ alone, `emit::host::on_d3dmetal`: under Wine with that adapter name):
   are not what it expects. The staged descriptor copy-in is unaffected. The
   two `descriptor::host` tests that read descriptors skip under Wine when
   the handle cannot be read, and fail elsewhere.
+- **R32G32B32 typed buffer UAVs abort.** For `R32G32B32_FLOAT`, `_UINT`
+  and `_SINT`, `CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT)` reports
+  typed unordered access (`Support1` = 0x3), then
+  `CreateUnorderedAccessView` logs `VK_ERROR_FORMAT_NOT_SUPPORTED` and aborts
+  in Metal's `MTLPixelFormatInvalid` assertion before it returns (a synthetic
+  probe on D3DMetal 3.0, CrossOver 26.3; reported in
+  pragyaangaur/VIctory-macOS PR #185). The call returns `void`, so nothing
+  can be checked after it. On D3DMetal (`emit::host::on_d3dmetal`)
+  `descriptor::host::buffer_uav` refuses such a typed view before the call:
+  the slot is left null, keeps no host resource, and is counted with the
+  other refused views (`REFUSED_VIEWS`). Raw and structured views of the
+  same bytes, and every other host, are unchanged. GPTK 4.0 is not
+  characterized yet, so the guard covers every D3DMetal.
+  `three_channel_typed_uavs_are_null_on_d3dmetal` checks it there.
+  Texture UAVs in these formats are not guarded.
 
 Wine's memory (not D3DMetal's):
 
