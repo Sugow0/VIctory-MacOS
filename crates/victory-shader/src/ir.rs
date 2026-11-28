@@ -1974,6 +1974,115 @@ mod tests {
         assert_eq!(i[2].read(Reg::Scc), i[1].write(Reg::Scc));
     }
 
+    /// The far jumps the scheduler spreads out (waits and other work between the four, the
+    /// offset as an inline constant or the add's first operand, the sum in another pair then
+    /// copied) are followed like the plain one; a write to the pair between them is not.
+    #[test]
+    fn follows_far_jumps_the_scheduler_spreads_out() {
+        let target = |words: &[u32]| {
+            let p = build_words(words, false);
+            match p.blocks[0].exit {
+                Exit::Jump(t) => Some(p.blocks[t].offset),
+                Exit::Indirect => None,
+                e => panic!("{e:?}"),
+            }
+        };
+        // waits and other work between: 4 + 32 = 36
+        let spread = [
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8008_FF08,
+            32,          // s_add_u32 s8, s8, 32
+            0xBE94_0381, // s_mov_b32 s20, 1
+            0x8209_8009, // s_addc_u32 s9, s9, 0
+            0xBF80_0000, // s_nop 0
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // not code
+            S_ENDPGM,
+        ];
+        assert_eq!(target(&spread), Some(36), "spread out");
+        // the sum in s[12:13] from s_getpc_b64's s[10:11], the literal first, then copied
+        let moved = [
+            0xBE8A_1F00, // s_getpc_b64 s[10:11]
+            0x800C_0AFF,
+            24,          // s_add_u32 s12, 24, s10 -> 4 + 24 = 28
+            0x820D_800B, // s_addc_u32 s13, s11, 0
+            0xBE88_040C, // s_mov_b64 s[8:9], s[12:13]
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // not code
+            S_ENDPGM,
+        ];
+        assert_eq!(target(&moved), Some(28), "through another pair");
+        // an inline constant: 4 + 16 = 20
+        let inline = [
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
+            0x8008_9008, // s_add_u32 s8, s8, 16
+            0x8209_8009, // s_addc_u32 s9, s9, 0
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // not code
+            S_ENDPGM,
+        ];
+        assert_eq!(target(&inline), Some(20), "inline offset");
+        // the high dword overwritten between: the address is not s_getpc_b64's
+        let clobbered = [
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
+            0x8008_FF08,
+            20,          // s_add_u32 s8, s8, 20
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // not code
+            S_ENDPGM,
+        ];
+        assert_eq!(target(&clobbered), None, "pair overwritten");
+        // a load into the pair between
+        let loaded = [
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
+            0x8008_FF08,
+            24,          // s_add_u32 s8, s8, 24
+            0xF404_0200,
+            0xFA00_0000, // s_load_dwordx2 s[8:9], s[0:1], 0
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // not code
+            S_ENDPGM,
+        ];
+        assert_eq!(target(&loaded), None, "pair loaded");
+        // no carry into the high dword, or one that is not the offset's sign
+        let carry = |c: Option<u32>| {
+            let mut w = vec![0xBE88_1F00, 0x8008_FF08, 20]; // s_getpc_b64 s[8:9]; s_add_u32 s8, s8, 20
+            w.extend(c);
+            w.extend([0xBE80_2008, 0xFFFF_FFFF, S_ENDPGM, S_ENDPGM]); // s_setpc_b64 s[8:9]
+            target(&w)
+        };
+        assert_eq!(carry(Some(0x8209_8009)), Some(24), "s_addc_u32 s9, s9, 0");
+        assert_eq!(carry(None), None, "no carry");
+        assert_eq!(carry(Some(0x8209_8109)), None, "s_addc_u32 s9, s9, 1");
+        assert_eq!(carry(Some(0x8209_C109)), None, "s_addc_u32 s9, s9, -1 after a positive offset");
+    }
+
+    /// A jump into the block right after a resolved far jump, whose own `s_setpc_b64` goes
+    /// through registers: the look back stops at the far jump's `s_setpc_b64` and does not take
+    /// its address.
+    #[test]
+    fn a_far_jump_is_not_read_through_another_jump() {
+        let p = build_words(
+            &[
+                0xBF84_0005, // s_cbranch_scc0 -> 24
+                0xBE88_1F00, // s_getpc_b64 s[8:9]
+                0x8008_FF08,
+                24,          // s_add_u32 s8, s8, 24 -> 8 + 24 = 32
+                0x8209_8009, // s_addc_u32 s9, s9, 0
+                0xBE80_2008, // s_setpc_b64 s[8:9]
+                0xBE80_2008, // 24: s_setpc_b64 s[8:9] (an address from elsewhere)
+                0xFFFF_FFFF, // not code
+                S_ENDPGM,    // 32
+            ],
+            false,
+        );
+        let at = |offset| p.blocks.iter().position(|b| b.offset == offset).unwrap();
+        assert_eq!(p.blocks[at(4)].exit, Exit::Jump(at(32)));
+        assert_eq!(p.blocks[at(24)].exit, Exit::Indirect);
+    }
+
     #[test]
     fn reports_what_it_cannot_express() {
         let code: Vec<u8> = [0xBE80_2E01_u32, S_ENDPGM] // s_movrels_b32 s0, s1
