@@ -3812,6 +3812,18 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
+/// Whether a buffer view is a typed one of R32G32B32 (FLOAT, UINT or
+/// SINT: formats 6 to 8), which D3DMetal 3.0 cannot make as an unordered
+/// access view ([`buffer_uav`]). Raw and structured views are not typed.
+fn three_channel_typed(format: DXGI_FORMAT, stride: u32, raw: bool) -> bool {
+    stride == 0
+        && !raw
+        && matches!(
+            format,
+            DXGI_FORMAT_R32G32B32_FLOAT | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT
+        )
+}
+
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
 /// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
 /// these that could not be moved there (null).
@@ -4065,6 +4077,19 @@ fn buffer_uav(
             raw,
             width,
             "unordered buffer view the host would refuse left null"
+        );
+        return None;
+    }
+    // D3DMetal 3.0 reports typed-UAV support for R32G32B32 (CheckFeatureSupport
+    // Support1 = 0x3), then aborts inside the void CreateUnorderedAccessView
+    // on Metal's MTLPixelFormatInvalid assertion: no HRESULT to check after.
+    // Refused before the call, as the views above, on D3DMetal alone
+    // (docs/macos.md). Ported from pragyaangaur/VIctory-macOS PR #185.
+    if three_channel_typed(desc.Format, stride, raw) && victory_shader::emit::host::on_d3dmetal() {
+        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        once!(
+            format = desc.Format.0,
+            "three-channel typed unordered buffer view on D3DMetal left null"
         );
         return None;
     }
@@ -5523,6 +5548,94 @@ mod tests {
         } else {
             assert_eq!(words(), before);
         }
+    }
+
+    /// R32G32B32 typed buffer views are the ones `buffer_uav` refuses on
+    /// D3DMetal; raw and structured views, and other typed formats, are not.
+    #[test]
+    fn three_channel_typed_views_are_told() {
+        for format in [
+            DXGI_FORMAT_R32G32B32_FLOAT,
+            DXGI_FORMAT_R32G32B32_UINT,
+            DXGI_FORMAT_R32G32B32_SINT,
+        ] {
+            assert!(three_channel_typed(format, 0, false), "{format:?}");
+            assert!(
+                !three_channel_typed(format, 12, false),
+                "structured {format:?}"
+            );
+            assert!(!three_channel_typed(format, 0, true), "raw {format:?}");
+        }
+        for format in [
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+            DXGI_FORMAT_R32G32_FLOAT,
+            DXGI_FORMAT_R32_UINT,
+            DXGI_FORMAT_R32_TYPELESS,
+        ] {
+            assert!(!three_channel_typed(format, 0, false), "{format:?}");
+        }
+    }
+
+    /// On D3DMetal a typed R32G32B32 unordered buffer view is left null
+    /// (`make` gives `None`) instead of aborting inside Metal, and the device
+    /// stays alive; the same bytes as R32_UINT are still made, so the refusal
+    /// is the format's. Elsewhere nothing to check: the host makes or refuses
+    /// it as before. Ported from pragyaangaur/VIctory-macOS PR #185.
+    #[test]
+    fn three_channel_typed_uavs_are_null_on_d3dmetal() {
+        if !victory_shader::emit::host::on_d3dmetal() {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        let memory = vec![0u64; 1 << 13];
+        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // SAFETY: a plain CPU-side heap of one view.
+        let cpu: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        // SAFETY: a live heap.
+        let at = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
+        const LEN: u64 = 4 * 456;
+        // A placed buffer of LEN bytes, viewed typed from its start:
+        // format, buffer dimension, first element 0, `count` elements.
+        let view = |format: DXGI_FORMAT, count: u32| {
+            let resource: [u32; 14] = [1, 0, 0, 0, LEN as u32, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[format.0 as u32, 1, 0, 0, count, 0, 0, 0, 0, 0]);
+            (desc[10], desc[11]) = (start as u32, (start >> 32) as u32);
+            View::Placed(true, resource, desc)
+        };
+        let key = start as usize;
+        crate::shadow::register(key, start, LEN);
+        let control = make(&view(DXGI_FORMAT_R32_UINT, 12), at);
+        let refused: Vec<_> = [
+            DXGI_FORMAT_R32G32B32_FLOAT,
+            DXGI_FORMAT_R32G32B32_UINT,
+            DXGI_FORMAT_R32G32B32_SINT,
+        ]
+        .into_iter()
+        .map(|format| (format, make(&view(format, 4), at).is_none()))
+        .collect();
+        crate::shadow::unregister(key, start);
+        assert!(
+            control.is_some_and(|kept| kept.is_some()),
+            "an R32_UINT view of the same bytes is made"
+        );
+        for (format, none) in refused {
+            assert!(none, "{format:?} is left null on D3DMetal");
+        }
+        // SAFETY: a plain device query.
+        assert!(
+            unsafe { host.device.GetDeviceRemovedReason() }.is_ok(),
+            "the device stays alive"
+        );
     }
 
     /// Views that begin where no host view can: raw ones off 16 bytes,
