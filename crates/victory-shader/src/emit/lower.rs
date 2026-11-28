@@ -1441,12 +1441,77 @@ pub fn set_host_max_wave(lanes: u32) {
 }
 
 thread_local! {
+    /// See [`keep_wave_why`].
+    static WAVE_WHY: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keeps this thread's wave64 diagnostics (the `WAVE64-WHY`, `WAVE64-RETRY`
+/// and `WAVE64-WIDE` lines `VICTORY_WAVE_WHY=1` prints) from now on, for
+/// [`take_wave_why`], whether that variable is set or not: the offline
+/// `translate --list` puts them next to the program they are about.
+pub fn keep_wave_why() {
+    WAVE_WHY.with_borrow_mut(|w| {
+        w.get_or_insert_with(Vec::new);
+    });
+}
+
+/// The wave64 diagnostics kept on this thread since the last call (none
+/// unless [`keep_wave_why`] was called).
+pub fn take_wave_why() -> Vec<String> {
+    WAVE_WHY.with_borrow_mut(|w| w.as_mut().map(std::mem::take).unwrap_or_default())
+}
+
+/// Whether wave64 diagnostics are asked for: printed (`VICTORY_WAVE_WHY`)
+/// or kept ([`keep_wave_why`]).
+pub(super) fn wave_why_on() -> bool {
+    std::env::var_os("VICTORY_WAVE_WHY").is_some() || WAVE_WHY.with_borrow(Option::is_some)
+}
+
+/// One wave64 diagnostic: printed with `VICTORY_WAVE_WHY`, kept with
+/// [`keep_wave_why`].
+pub(super) fn wave_why(line: String) {
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        eprintln!("{line}");
+    }
+    WAVE_WHY.with_borrow_mut(|w| {
+        if let Some(w) = w {
+            w.push(line);
+        }
+    });
+}
+
+#[cfg(test)]
+mod wave_why_tests {
+    /// Diagnostics are kept only once asked for, per thread, in the order
+    /// made, and each take empties the log.
+    #[test]
+    fn wave64_diagnostics_are_kept_per_thread_once_asked_for() {
+        std::thread::spawn(|| {
+            super::wave_why("WAVE64-WHY before".into());
+            assert!(super::take_wave_why().is_empty(), "kept without being asked for");
+            super::keep_wave_why();
+            assert!(super::wave_why_on());
+            super::wave_why("WAVE64-WHY one".into());
+            super::wave_why("WAVE64-RETRY two".into());
+            // (another thread keeps its own, here none)
+            std::thread::spawn(|| {
+                super::wave_why("WAVE64-WHY elsewhere".into());
+                assert!(super::take_wave_why().is_empty());
+            })
+            .join()
+            .unwrap();
+            assert_eq!(super::take_wave_why(), ["WAVE64-WHY one", "WAVE64-RETRY two"]);
+            assert!(super::take_wave_why().is_empty(), "a take empties the log");
+        })
+        .join()
+        .unwrap();
+    }
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -2002,7 +2067,7 @@ impl<'a> Lower<'a> {
                     }
                 }
                 // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
-                if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                if wave == 64 && wave_why_on() {
                     let mut why: Vec<&str> = Vec::new();
                     for i in insts() {
                         let n = i.name();
@@ -2037,7 +2102,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                     why.sort_unstable();
-                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                    wave_why(format!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", ")));
                 }
             }
             if wave == 32 && x.native.wave64 {

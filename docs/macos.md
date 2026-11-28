@@ -69,6 +69,19 @@ What the runtime chooses from a capability it reports:
   run in waves of 32 is refused by the translator (`emit::emit`,
   `WIDER_THAN_HOST`), and the test host refuses a wave size outside the
   device's (`emit::host::Host::compute_pipeline_with`).
+  Which programs that refuses, and why, is counted offline and natively
+  (no Wine; the archive is only read):
+  `scripts/wave64-refusals.sh [out.txt] [paths...]` (default
+  `~/victory-data/wave64-refusals.txt` over the title's `shaders.rpf`) runs
+  `VICTORY_HOST_WAVE=32 VICTORY_HOST_D3DMETAL=1 victory translate --list`,
+  whose list then carries, after each program refused for its wave size,
+  the `VICTORY_WAVE_WHY` diagnostics of every attempt
+  (`emit::keep_wave_why`), and writes one line per program (hash, stage,
+  thread group, class) and a count per class: (a) an indirect exit,
+  (b) LDS read and written inside a per-lane branch in a group over 32,
+  `+c` when a retried form then stopped at cross-lane code where not every
+  lane runs. Other `VICTORY_*` variables pass through
+  (`VICTORY_WAVE_WIDE=1 scripts/wave64-refusals.sh /tmp/wide.txt`).
 - **Doubles.** `DoublePrecisionFloatShaderOps` is 0 and a double addition
   gives 0. The tests skip double arithmetic on such a device; the translator
   does not refuse console f64 code there (`v_add_f64` and the like): those

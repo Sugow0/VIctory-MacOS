@@ -120,7 +120,7 @@ pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{
     host_settings, set_host_derived_vertices, set_host_max_wave, set_host_metal_mesh_limit, set_host_rdna,
-    set_thread_max_wave,
+    set_thread_max_wave, keep_wave_why, take_wave_why,
 };
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -466,7 +466,7 @@ pub fn emit_with_retries(
 }
 
 /// Refusal of a program whose `WaveSize` is wider than the host's waves.
-pub(crate) const WIDER_THAN_HOST: &str = "a wave size wider than the host's waves";
+pub const WIDER_THAN_HOST: &str = "a wave size wider than the host's waves";
 
 /// The wave size a DXIL container's program asks for (`WaveSize(n)`: PSV0's
 /// expected lane counts, equal), if it asks for one.
@@ -535,12 +535,12 @@ fn emit_any_wave(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
-        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let why = lower::wave_why_on();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => lower::wave_why(format!("WAVE64-RETRY {what}: wave {wave:?}")),
+                    Err(e) => lower::wave_why(format!("WAVE64-RETRY {what}: {e}")),
                 }
             }
         };
@@ -558,7 +558,7 @@ fn emit_any_wave(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    lower::wave_why(format!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}"));
                 }
                 false
             }
@@ -683,7 +683,7 @@ fn emit_any_wave(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, lower::wave_why_on());
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -731,7 +731,7 @@ fn widen(
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
+                lower::wave_why(format!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads));
             }
             return Err(NOT);
         }
@@ -752,7 +752,7 @@ fn widen(
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
             if why {
-                eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
+                lower::wave_why(format!("WAVE64-WIDE {} branches taken wave-wide", wide.len()));
             }
             return r;
         }
@@ -763,7 +763,7 @@ fn widen(
             .collect();
         if more.is_empty() {
             if why {
-                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
+                lower::wave_why(format!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len()));
             }
             return r;
         }

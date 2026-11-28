@@ -649,7 +649,27 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit_with_retries(container, &p, &program, &s, &i, &r) {
+                    // With `--list`, a console wave64 compute program's wave64 diagnostics
+                    // (`VICTORY_WAVE_WHY`'s lines) are listed after it, on one line, if it is refused
+                    // for its wave size (`scripts/wave64-refusals.sh` classifies them).
+                    let why = t.list && p.stage == HwStage::Cs && p.wave64;
+                    if why {
+                        emit::keep_wave_why();
+                        emit::take_wave_why();
+                    }
+                    let emitted = emit::emit_with_retries(container, &p, &program, &s, &i, &r);
+                    if why {
+                        let lines = emit::take_wave_why();
+                        if matches!(&emitted, Err(ShaderError::Unsupported { what, .. }) if *what == emit::WIDER_THAN_HOST) {
+                            let group = match &p.io {
+                                victory_shader::native::StageIo::Cs(cs) => format!("{:?}", cs.threads),
+                                _ => String::new(),
+                            };
+                            // (one line, in the order the attempts made them: the list is sorted)
+                            t.lines.push(format!("{}  wave64 threads={group}: {}", label(), lines.join(" | ")));
+                        }
+                    }
+                    match emitted {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
