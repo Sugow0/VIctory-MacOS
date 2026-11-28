@@ -187,6 +187,23 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+/// The host lists of `lists` as `crate::valuetrace` knows them: the parts
+/// before the current one ([`cut`]), then the current one.
+#[cfg(windows)]
+pub(crate) fn trace_ids(lists: &[This]) -> Vec<usize> {
+    let mut ids = Vec::new();
+    for &this in lists {
+        if this.is_null() {
+            continue;
+        }
+        // SAFETY: the title passes our lists, closed and not recording.
+        let list = unsafe { &*this.cast::<List>() };
+        ids.extend(list.earlier.iter().map(|p| p.host.trace_id()));
+        ids.extend(list.host.as_ref().map(crate::host::HostList::trace_id));
+    }
+    ids
+}
+
 /// The host side of a submitted list, taken from it: a queue that waits
 /// for a fence runs it later, and the title may reset the list meanwhile.
 /// With it go the upload memory and the dynamic descriptor slots its
@@ -277,6 +294,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         return;
     }
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+        // Its next recording is another list for `crate::valuetrace`.
+        crate::valuetrace::recycled(host.trace_id());
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
@@ -1984,6 +2003,11 @@ pub(crate) struct ValueWait {
 }
 
 impl ValueWait {
+    /// `(address, comparison, reference, 64-bit)`, for `crate::valuetrace`.
+    pub(crate) fn parts(&self) -> (u64, u32, u64, bool) {
+        (self.address, self.comparison, self.reference, self.wide)
+    }
+
     /// Whether the memory holds what is waited for now.
     /// shortcut: the comparison codes are taken to be the comparison
     /// functions' (1 never .. 8 always, value against reference); one not
@@ -2221,6 +2245,10 @@ fn value_written(this: This, address: u64, value: u64) {
     {
         if address == 0 || this.is_null() {
             return;
+        }
+        if crate::valuetrace::on() {
+            let host = host_list(this).map_or(0, crate::host::HostList::trace_id);
+            crate::valuetrace::wrote(address, value, this as usize, host);
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = value;

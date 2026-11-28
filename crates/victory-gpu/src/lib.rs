@@ -106,6 +106,7 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 pub mod timeline;
+mod valuetrace;
 #[cfg(windows)]
 pub mod titlewrite;
 #[cfg(windows)]

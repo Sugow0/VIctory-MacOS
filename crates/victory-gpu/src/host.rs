@@ -5372,6 +5372,9 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
+        if crate::valuetrace::on() {
+            crate::valuetrace::staged(runs.iter().map(|l| l.trace_id()), None, crate::valuetrace::Stage::Running);
+        }
         let _ = self.submit(runs, &[], false);
     }
 
@@ -5388,6 +5391,9 @@ impl Host {
     /// [`Host::execute_late`] of parts of submissions in one: another begins
     /// at each place of `order` in `parts` ([`joins`]).
     pub(crate) fn execute_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+        if crate::valuetrace::on() {
+            crate::valuetrace::staged(lists.iter().map(|l| l.host().trace_id()), None, crate::valuetrace::Stage::InFlight);
+        }
         if order.is_empty() {
             crate::list::recycle(lists, &order);
             return;
@@ -7291,6 +7297,12 @@ impl HostList {
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    }
+
+    /// The list's name for `crate::valuetrace`: its allocator, which stays
+    /// where it is when the list is taken from the title's.
+    pub(crate) fn trace_id(&self) -> usize {
+        self.allocator.as_raw() as usize
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

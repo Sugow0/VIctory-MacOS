@@ -84,6 +84,16 @@ pub(super) trait Work: Send {
     }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
+    /// Whether [`Work::standing`] and [`Work::forced_past`] are told
+    /// (`crate::valuetrace`).
+    fn traced() -> bool {
+        false
+    }
+    /// `queue`'s first entry stands at `ask` (`stands`), or goes past it.
+    fn standing(_queue: usize, _ask: &Self::Ask, _stands: bool) {}
+    /// `queue`'s first entry goes at a present with `ask` found not met
+    /// (by the look that forced it: not asked again).
+    fn forced_past(_queue: usize, _ask: &Self::Ask) {}
     /// Renderer port #7 (`crate::port_journal`, from renderer patch #4): a mark taken when an entry is
     /// put in the line (by the thread that puts it, before the line's lock):
     /// the round of the heaps' records begun after that. 0: none.
@@ -327,8 +337,15 @@ impl<W: Work> Lane<W> {
         let Some(&(first, ..)) = heads.first() else {
             return false;
         };
-        let ready = heads.iter().find(|(number, _, ask, shows)| match ask {
-            Some(ask) => W::met(ask),
+        let traced = W::traced();
+        let ready = heads.iter().find(|(number, queue, ask, shows)| match ask {
+            Some(ask) => {
+                let met = W::met(ask);
+                if traced {
+                    W::standing(*queue, ask, !met);
+                }
+                met
+            }
             // A present comes behind everything given before it.
             None => !shows || *number == first || !super::forces(),
         });
@@ -405,8 +422,12 @@ impl<W: Work> Lane<W> {
             }
             let Entry { number, queue, what, mark: theirs } = next;
             let waits = what.ask().is_some() && what.raises();
+            let asked = if traced { what.ask() } else { None };
             match entry.what.take_along(what) {
                 Ok(run) => {
+                    if let Some(ask) = &asked {
+                        W::standing(queue, ask, false);
+                    }
                     runs += usize::from(run);
                     mark = mark.max(theirs);
                     if waits {
@@ -423,6 +444,12 @@ impl<W: Work> Lane<W> {
         if runs > 0 {
             let floor = self.lock().floor(entry.queue);
             entry.what.marked(mark.max(floor));
+        }
+        if traced && let Some(ask) = entry.what.ask() {
+            if forced {
+                W::forced_past(entry.queue, &ask);
+            }
+            W::standing(entry.queue, &ask, false);
         }
         entry.what.go(forced);
         {
@@ -545,6 +572,24 @@ impl Work for Job {
 
     fn shows(&self) -> bool {
         matches!(self, Job::Present(..))
+    }
+
+    fn traced() -> bool {
+        crate::valuetrace::on()
+    }
+
+    fn standing(queue: usize, ask: &Ask, stands: bool) {
+        if let Ask::Value(wait) = ask {
+            crate::valuetrace::standing(queue, wait, stands);
+        }
+    }
+
+    fn forced_past(queue: usize, ask: &Ask) {
+        // (Forced: it was found not met just now; not asked again, which
+        // could settle the flights.)
+        if let Ask::Value(wait) = ask {
+            crate::valuetrace::unmet_at_present(queue, wait, &|other| LANE.head_of(other));
+        }
     }
 
     fn runs(&self) -> bool {
@@ -683,6 +728,30 @@ impl Work for Job {
 }
 
 static LANE: Lane<Job> = Lane::new();
+
+impl Lane<Job> {
+    /// What `queue` has first in the line, in words (`crate::valuetrace`).
+    fn head_of(&self, queue: usize) -> String {
+        let state = self.lock();
+        let mine = state.items.iter().filter(|e| e.queue == queue).count();
+        let running = if state.running == Some(queue) { "; one of its entries is being done" } else { "" };
+        let Some(first) = state.items.iter().find(|e| e.queue == queue) else {
+            return format!("nothing in the line{running}");
+        };
+        let what = match &first.what {
+            &Job::Wait(fence, value) => {
+                format!("a wait for fence {fence:#x} to reach {value} (it is at {})", crate::fence::completed(fence as This))
+            }
+            Job::Value(wait) => format!("a wait for a memory value {wait:?} (met in memory: {})", wait.met()),
+            Job::Run(_, _, order) => format!("a submission of {} lists", order.len()),
+            Job::Joined(_, _, order, ..) => format!("submissions joined, {} lists", order.len()),
+            Job::Signal(fence, value) => format!("a signal of fence {fence:#x} to {value}"),
+            Job::Present(..) => "a present".into(),
+            Job::Lists(..) => "a submission not translated yet".into(),
+        };
+        format!("{what}, of {mine} entries of its in the line (entry {} of all){running}", first.number)
+    }
+}
 
 /// Submissions and presents in the line that have not been given to the host
 /// yet.
@@ -886,6 +955,13 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
             jobs.extend(waits.into_iter().map(Job::Value));
             jobs.push(Job::Run(queue, taken, order));
         }
+    }
+    if crate::valuetrace::on() {
+        let ids = jobs.iter().flat_map(|j| match j {
+            Job::Run(_, taken, _) => taken.iter().map(|l| l.host().trace_id()).collect(),
+            _ => Vec::new(),
+        });
+        crate::valuetrace::staged(ids, Some(queue), crate::valuetrace::Stage::InLine);
     }
     jobs
 }
