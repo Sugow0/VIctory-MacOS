@@ -190,6 +190,14 @@ pub fn run(
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
     }
+    // The title's hang watchdog (VICTORY_HANG_WATCHDOG; off under Wine,
+    // where its world load outlasts the 30 s it allows, on elsewhere).
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, and nothing of it has run yet.
+        unsafe { victory_loader::hang_watchdog::apply_asked(&hash, image.base(), size) };
+    }
     // Renderer port #2 (VICTORY_PORT_DESCRIPTORS=1): the title's stores of
     // descriptor records tell the layer their slots.
     #[cfg(windows)]
