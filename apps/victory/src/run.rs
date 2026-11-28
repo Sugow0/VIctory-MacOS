@@ -246,6 +246,18 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
+    // Every listed 256-bit store of the title split into 128-bit halves
+    // (VICTORY_PATCH_WIDE=<list from `cargo xtask wide-stores`>, off without
+    // it): Rosetta stops on one that faults in its second page. Last of the
+    // patches: it copies the bytes the others left, and refuses theirs.
+    #[cfg(windows)]
+    {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        if let Some((n, refused)) = unsafe { victory_loader::wide::patch_asked(image.base() as u64, size) } {
+            println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
+        }
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

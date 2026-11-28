@@ -3,6 +3,7 @@
 mod policy;
 #[cfg(test)]
 mod switches;
+mod wide_stores;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,12 +29,19 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// List the title's 256-bit stores for `VICTORY_PATCH_WIDE` (macOS):
+    /// `cargo xtask wide-stores <cached title image> > wide-sites.txt`.
+    WideStores {
+        /// The mapped title image in VIctory's cache (`images/victory-image-<hash>.dll`).
+        image: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::WideStores { image } => wide_stores::run(&image),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

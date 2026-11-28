@@ -286,6 +286,8 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
         VirtualProtect(at as *const _, code.len(), old, &mut old);
         FlushInstructionCache(GetCurrentProcess(), at as *const _, code.len());
     }
+    // Noted, so that `wide.rs` does not move these bytes.
+    crate::patched::take(at, code.len());
     Patched::Done
 }
 

@@ -169,6 +169,7 @@ pub unsafe fn apply(base: usize, size: usize, marks: usize, sites: &[Site]) -> V
                 VirtualProtect(at as *const _, site.len, old, &mut old);
                 FlushInstructionCache(GetCurrentProcess(), at as *const _, site.len);
             }
+            crate::patched::take(at, site.len);
             *used += body.len().next_multiple_of(16);
             Hooked::Done
         })();
@@ -287,6 +288,7 @@ unsafe fn write_code(at: usize, bytes: &[u8], len: usize) -> bool {
         VirtualProtect(at as *const _, len, old, &mut old);
         FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
     }
+    crate::patched::take(at, len);
     true
 }
 

@@ -31,6 +31,7 @@ mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;
 pub mod frame_rate;
+pub(crate) mod patched;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;
@@ -47,6 +48,7 @@ mod thunks;
 mod tls;
 #[cfg(windows)]
 pub mod write_sites;
+pub mod wide;
 #[cfg(windows)]
 mod windows;
 
