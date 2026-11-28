@@ -1049,6 +1049,42 @@ pub(crate) enum View {
     Placed(bool, [u32; 14], [u32; 16]),
 }
 
+/// What the words of an unordered view of a texture the title placed
+/// itself (`View::Placed(true, ..)`, no buffer) say, for the host's warning
+/// (`host::make` gives such views no resource on any host).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct PlacedTextureUav {
+    /// The view names no memory (words 10 and 11 are 0): there is no
+    /// texture to write to or to mirror.
+    pub(crate) no_memory: bool,
+    /// Word 2 is a shader component mapping (bit 12 set, below 2^13), as
+    /// in a shader resource view's description; in an unordered view's it
+    /// would be the mip level (fewer than 16) or a buffer's first element.
+    pub(crate) shader_words: bool,
+    /// The view's format is block-compressed (BC1 to BC7, typeless, UNORM,
+    /// sRGB, SNORM, UF16/SF16: DXGI 70 to 84 and 94 to 99), which no D3D12
+    /// host (nor RDNA's image stores) writes as unordered access.
+    pub(crate) compressed: bool,
+}
+
+/// [`PlacedTextureUav`] of a placed unordered view's resource description
+/// and view words; `None` for a buffer.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn placed_texture_uav(resource: &[u32; 14], desc: &[u32; 16]) -> Option<PlacedTextureUav> {
+    const BUFFER: u32 = 1;
+    const MAPPING_SET: u32 = 1 << 12;
+    if resource[0] == BUFFER {
+        return None;
+    }
+    let format = desc[0];
+    Some(PlacedTextureUav {
+        no_memory: desc[10] == 0 && desc[11] == 0,
+        shader_words: desc[2] & MAPPING_SET != 0 && desc[2] < 2 * MAPPING_SET,
+        compressed: (70..=84).contains(&format) || (94..=99).contains(&format),
+    })
+}
+
 impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
     /// of resources or of memory) or memory the title placed a texture in:
@@ -1796,6 +1832,53 @@ static FUNCTIONS: Table<24> = {
     f[10] = start as *const (); // 0x50 GPU
     Table(f)
 };
+
+#[cfg(test)]
+mod placed_texture_uav_tests {
+    use super::{PlacedTextureUav, placed_texture_uav};
+
+    /// Resource and view words as Grand Theft Auto VI passed them under
+    /// CrossOver 26.3 (run r4, 2026-11-28): a 256² BC1 array of 64 slices
+    /// and a 512² BC7 one, viewed in a shader view's layout, at no address.
+    #[test]
+    fn the_loading_screen_views_name_no_memory_in_shader_view_words() {
+        let bc1 = [3, 1, 0, 0, 256, 0, 256, 589888, 71, 1, 0, 266, 3145728, 28671];
+        let bc7 = [3, 1, 0, 0, 512, 0, 512, 655392, 98, 1, 0, 266, 3145728, 28671];
+        let view = |format: u32| [format, 5, 5768, 0, 0, 15, 0, 4095, 0, 0, 0, 0, 0, 0, 0, 0];
+        let seen = PlacedTextureUav { no_memory: true, shader_words: true, compressed: true };
+        assert_eq!(placed_texture_uav(&bc1, &view(71)), Some(seen));
+        assert_eq!(placed_texture_uav(&bc7, &view(98)), Some(seen));
+    }
+
+    #[test]
+    fn an_unordered_view_of_placed_memory_is_told_apart() {
+        let texture = [3, 0, 0, 0, 128, 0, 128, 0x10001, 53, 1, 0, 0, 0, 0];
+        // R32G32_UINT, 2D, mip 3, at 0xd_4940_0000: an unordered view's
+        // words, with memory, of a format hosts write.
+        let mut desc = [53, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0x4940_0000, 0xd, 0, 0, 0, 0];
+        assert_eq!(
+            placed_texture_uav(&texture, &desc),
+            Some(PlacedTextureUav { no_memory: false, shader_words: false, compressed: false })
+        );
+        // Only the high word of the address set: memory all the same.
+        (desc[10], desc[11]) = (0, 1);
+        assert!(!placed_texture_uav(&texture, &desc).unwrap().no_memory);
+        // The edges of the compressed formats.
+        for (format, compressed) in [(69, false), (70, true), (84, true), (85, false), (93, false), (94, true), (99, true), (100, false)] {
+            desc[0] = format;
+            assert_eq!(placed_texture_uav(&texture, &desc).unwrap().compressed, compressed, "format {format}");
+        }
+        // A mapping word needs bit 12 and nothing above it.
+        for (word, shader) in [(0xfff, false), (0x1000, true), (0x1688, true), (0x1fff, true), (0x2000, false), (0x3688, false)] {
+            desc[2] = word;
+            assert_eq!(placed_texture_uav(&texture, &desc).unwrap().shader_words, shader, "word {word:#x}");
+        }
+        // Buffers are not asked about.
+        let mut buffer = texture;
+        buffer[0] = 1;
+        assert_eq!(placed_texture_uav(&buffer, &desc), None);
+    }
+}
 
 #[cfg(test)]
 mod tests {
