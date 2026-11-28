@@ -119,7 +119,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{
-    host_settings, set_host_derived_vertices, set_host_max_wave, set_host_rdna, set_thread_max_wave,
+    host_settings, set_host_derived_vertices, set_host_max_wave, set_host_metal_mesh_limit, set_host_rdna,
+    set_thread_max_wave,
 };
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -298,6 +299,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.push(u8::from(lower::host_derived_vertices()));
+    out.push(u8::from(lower::host_metal_mesh_limit()));
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
