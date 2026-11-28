@@ -126,6 +126,18 @@ alone, `emit::host::on_d3dmetal`: under Wine with that adapter name):
   are not what it expects. The staged descriptor copy-in is unaffected. The
   two `descriptor::host` tests that read descriptors skip under Wine when
   the handle cannot be read, and fail elsewhere.
+- **Not D3DMetal's: placed unordered texture views.** The warning
+  "placed unordered texture view not mirrored" seen on Grand Theft Auto
+  VI's loading screen under CrossOver 26.3 (2026-11-28) comes from
+  `descriptor::host::make`, which gives unordered views of textures the
+  title placed itself no resource on every host (Windows too), not from
+  the opaque handles above. Every such view of that run named no memory
+  (address 0), on 256² BC1 (DXGI 71) arrays of 64 slices and 512² BC7 (98)
+  ones, in words laid out as a shader view's (component mapping 0x1688 in
+  word 2), not an unordered view's: there was no texture to mirror, nor a
+  uint alias of one. The warning now says so (`no_memory`, `shader_words`,
+  `compressed`) and gives all 16 words. A run on Windows says whether the
+  title asks for these there as well.
 
 Wine's memory (not D3DMetal's):
 
