@@ -56,6 +56,12 @@ pub mod dll_flags {
     pub const GUARD_CF: u16 = 0x4000;
 }
 
+/// `IMAGE_SECTION_HEADER::Characteristics` flags.
+pub mod section_flags {
+    /// `IMAGE_SCN_MEM_EXECUTE`: the section holds code.
+    pub const MEM_EXECUTE: u32 = 0x2000_0000;
+}
+
 /// `IMAGE_OPTIONAL_HEADER64::Subsystem` values.
 pub mod subsystem {
     pub const WINDOWS_GUI: u16 = 2;

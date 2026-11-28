@@ -113,13 +113,18 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
 static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
 pub(crate) const STUBS_LEN: usize = 64 << 10;
 
-/// Memory for code within reach of a `jmp rel32` at `at`.
+/// Memory for code within reach of a `jmp rel32` at `at` ([`STUBS_LEN`] bytes).
 pub(crate) fn near(at: usize) -> Option<usize> {
+    near_len(at, STUBS_LEN)
+}
+
+/// [`near`] with `len` bytes.
+pub(crate) fn near_len(at: usize, len: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
     let at = at & !0xffff;
     (0x10_0000..0x7000_0000).step_by(0x10_0000).flat_map(|d| [at.checked_sub(d), at.checked_add(d)]).flatten().find_map(|place| {
         // SAFETY: reserves free memory at that address or fails.
-        let got = unsafe { VirtualAlloc(place as *const _, STUBS_LEN, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
+        let got = unsafe { VirtualAlloc(place as *const _, len, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
         (got != 0).then_some(got)
     })
 }

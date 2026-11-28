@@ -197,6 +197,11 @@ impl LoadedImage {
         &self.info
     }
 
+    /// The prepared copy the image is mapped from (in the cache).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Address of an export of the image, if it has one by that name.
     pub fn export(&self, name: &str) -> Option<usize> {
         let name = CString::new(name).ok()?;

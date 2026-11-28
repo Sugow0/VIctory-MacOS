@@ -246,6 +246,24 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
+    // The title's masked stores redone with plain stores Rosetta can resume
+    // after a fault (VICTORY_PATCH_MASKED; on by default under Wine). Last of
+    // the load-time patches, after write_sites, descriptor_sites, frame_rate
+    // and resolution: a store whose bytes in memory are no longer the image
+    // file's (one of those wrote there) is left alone, so no two patches
+    // claim the same bytes.
+    if execute {
+        for (name, dll) in &dlls {
+            // SAFETY: mapped, bound, and none of its code has run yet.
+            unsafe {
+                victory_loader::masked::patch_asked(name, dll.base(), dll.info(), dll.path(), false)
+            };
+        }
+        // SAFETY: as above.
+        unsafe {
+            victory_loader::masked::patch_asked(&image_name, image.base(), image.info(), image.path(), true)
+        };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -483,6 +501,11 @@ impl LateDlls {
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
+                    // SAFETY: just mapped and bound; no thread runs its code
+                    // before its `DllMain`, below.
+                    unsafe {
+                        victory_loader::masked::patch_asked(name, dll.base(), dll.info(), dll.path(), false)
+                    };
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());
