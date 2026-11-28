@@ -163,34 +163,76 @@ fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError
 /// into s(n+1), `s_setpc_b64 s[n:n+1]`, looking back over the straight-line
 /// run just decoded. Any other `s_setpc_b64` (e.g. a handover to the next
 /// merged stage through registers) gives `None`.
+///
+/// The address is followed back through the run as a pair of registers (low,
+/// high), so the scheduler's forms resolve too: other instructions between the
+/// four (waits, `s_nop`, work on other registers), the offset as either operand
+/// of the add or an inline constant, the sum written to another pair than
+/// `s_getpc_b64`'s (`s_add_u32 s8, s10, lit` / `s_addc_u32 s9, s11, 0`), and
+/// copies (`s_mov_b32`, `s_mov_b64`). The carry into the high dword must be
+/// there and be the offset's sign (`s_addc_u32` after `s_add_u32`,
+/// `s_subb_u32` after `s_sub_u32`, of 0, or -1 for a negative offset).
+/// Anything else that writes the pair (a call among them), or an instruction
+/// that does not fall through to the next (another jump), leaves the jump
+/// indirect.
+// shortcut: as before, a branch from elsewhere into the run (with other
+// registers) is not looked for; the compiler keeps the run straight.
 fn far_jump<'a>(
     before: impl Fn(usize) -> Option<&'a Instruction>,
     setpc: &Instruction,
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
-    let n = setpc.words[0] & 0xFF;
-    let mut delta = None;
+    /// Instructions looked back over.
+    const RUN: usize = 12;
+    let n = (setpc.words[0] & 0xFF) as u8;
+    if n > 104 {
+        return Ok(None);
+    }
+    // the registers holding the address's low and high dword, and the offset added so far
+    let (mut lo, mut hi) = (n, n + 1);
+    let mut delta: Option<i64> = None;
+    // the carry seen: whether by `s_addc_u32` (else `s_subb_u32`), and its constant
+    let mut carried: Option<(bool, i64)> = None;
     let mut at = setpc.offset;
-    for _ in 0..4 {
+    for _ in 0..RUN {
         let Some(prev) = before(at) else {
             break;
         };
         if prev.offset + 4 * prev.words.len() != at {
             break;
         }
-        let w = prev.words[0];
-        let (sdst, ssrc0, ssrc1) = ((w >> 16) & 0x7F, w & 0xFF, (w >> 8) & 0xFF);
-        match (prev.encoding, prev.name()) {
-            (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
-                if sdst == n && ssrc0 == n && ssrc1 == 0xFF && delta.is_none() =>
-            {
-                // The low dword of a signed 64-bit offset: a backward jump
-                // adds a negative one (its high dword is -1).
-                let literal = i64::from(prev.words[1] as i32);
-                delta = Some(if op == "s_add_u32" { literal } else { -literal });
-            }
-            (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
-                let Some(delta) = delta else { break };
+        at = prev.offset;
+        let name = prev.name().unwrap_or("");
+        if prev.encoding == Encoding::Sopp
+            && (name == "s_branch" || name.starts_with("s_endpgm") || name == "s_code_end")
+            || matches!(name, "s_setpc_b64" | "s_rfe_b64" | "s_swappc_b64" | "s_call_b64")
+        {
+            // the run does not reach the jump through it (a jump, a return, a call: what the
+            // pair holds after a call is the callee's)
+            break;
+        }
+        let fields = prev.fields(true);
+        let (dst, src) = match &fields {
+            Fields::Sop { dst, src, .. } => (*dst, src.as_slice()),
+            _ => (None, &[][..]),
+        };
+        let reg = |o: Option<&Operand>| match o {
+            Some(&Operand::Scalar { code, .. }) => Some(code),
+            _ => None,
+        };
+        let constant = |o: Option<&Operand>| match o {
+            Some(&Operand::Literal(v)) => Some(i64::from(v as i32)),
+            Some(&Operand::Const(c @ 128..=192)) => Some(i64::from(c) - 128),
+            Some(&Operand::Const(c @ 193..=208)) => Some(192 - i64::from(c)),
+            _ => None,
+        };
+        let d = reg(dst.as_ref());
+        match name {
+            "s_getpc_b64" if d == Some(lo) && hi == lo + 1 => {
+                let Some(delta) = delta else { return Ok(None) };
+                if carried.is_none() {
+                    return Ok(None);
+                }
                 // s_getpc_b64 yields the address of the instruction after it.
                 return usize::try_from(prev.offset as i64 + 4 + delta)
                     .ok()
@@ -198,11 +240,64 @@ fn far_jump<'a>(
                     .map(Some)
                     .ok_or(isa(setpc.offset, "far jump target outside the code"));
             }
+            "s_add_u32" | "s_sub_u32" if d == Some(lo) && delta.is_none() => {
+                // The low dword of a signed 64-bit offset: a backward jump
+                // adds a negative one (its high dword is -1).
+                let (a, b) = (src.first(), src.get(1));
+                let (from, k) = match (reg(a), constant(b), constant(a), reg(b)) {
+                    (Some(r), Some(k), _, _) => (r, k),
+                    (_, _, Some(k), Some(r)) if name == "s_add_u32" => (r, k),
+                    _ => return Ok(None),
+                };
+                // the carry's constant is the high dword of the 64-bit offset: k's sign
+                let add = name == "s_add_u32";
+                if carried != Some((add, if k < 0 { -1 } else { 0 })) {
+                    return Ok(None);
+                }
+                delta = Some(if add { k } else { -k });
+                lo = from;
+            }
+            "s_addc_u32" | "s_subb_u32" if d == Some(hi) && carried.is_none() && delta.is_none() => {
+                let (a, b) = (src.first(), src.get(1));
+                let (r, k) = match (reg(a), constant(b), constant(a), reg(b)) {
+                    (Some(r), Some(k), _, _) => (r, k),
+                    (_, _, Some(k), Some(r)) if name == "s_addc_u32" => (r, k),
+                    _ => return Ok(None),
+                };
+                hi = r;
+                carried = Some((name == "s_addc_u32", k));
+            }
+            "s_mov_b32" if d == Some(lo) || d == Some(hi) => {
+                let Some(r) = reg(src.first()) else { return Ok(None) };
+                if d == Some(lo) {
+                    lo = r;
+                } else {
+                    hi = r;
+                }
+            }
+            "s_mov_b64" if d == Some(lo) && hi == lo + 1 => {
+                let Some(r) = reg(src.first()) else { return Ok(None) };
+                (lo, hi) = (r, r + 1);
+            }
+            _ if writes_scalar(&fields, lo) || writes_scalar(&fields, hi) => return Ok(None),
             _ => {}
         }
-        at = prev.offset;
     }
     Ok(None)
+}
+
+/// Whether an instruction of these fields writes SGPR `code` (its explicit
+/// destinations; the implicit ones, VCC, EXEC and SCC, are none of s0-s105).
+fn writes_scalar(fields: &Fields, code: u8) -> bool {
+    let hits = |o: &Option<Operand>| {
+        matches!(*o, Some(Operand::Scalar { code: c, dwords }) if (c..c + dwords.max(1)).contains(&code))
+    };
+    match fields {
+        Fields::Sop { dst, .. } => hits(dst),
+        Fields::Smem { data, .. } => hits(data),
+        Fields::Valu(v) => hits(&v.dst) || hits(&v.carry),
+        _ => false,
+    }
 }
 
 fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
