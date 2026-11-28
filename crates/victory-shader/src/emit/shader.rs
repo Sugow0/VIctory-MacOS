@@ -227,6 +227,9 @@ pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
+    /// A linked translation (`mesh_link`): the kept signature elements get
+    /// the pair's registers once lowered.
+    pub repack_signatures: bool,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     /// A mesh shader's per-primitive outputs.
@@ -293,6 +296,7 @@ impl Shader {
                 res_ret,
             },
             pixel,
+            repack_signatures: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
@@ -777,6 +781,20 @@ impl Shader {
             self.m.named_md("dx.resources", vec![r]);
         }
 
+        // (before the view state, which counts the registers)
+        if self.pixel {
+            container::same_mode_per_row(&mut self.inputs, true);
+            if self.repack_signatures {
+                super::mesh_link::lay_out_inputs(&mut self.inputs);
+            } else {
+                super::mesh_link::note_pixel_inputs(&self.inputs);
+            }
+        } else {
+            container::same_mode_per_row(&mut self.outputs, false);
+            if self.repack_signatures {
+                super::mesh_link::lay_out_outputs(&mut self.outputs, &mut self.prims);
+            }
+        }
         let graphics = self.threads.is_none() || self.mesh.is_some();
         if graphics {
             // shortcut: every output is declared to depend on every input; the
@@ -816,11 +834,6 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
-        if self.pixel {
-            container::same_mode_per_row(&mut self.inputs, true);
-        } else {
-            container::same_mode_per_row(&mut self.outputs, false);
-        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
@@ -976,7 +989,7 @@ impl Shader {
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
         });
-        let hash = [0u8; 20];
+        let hash = container::shader_hash(&dxil);
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];

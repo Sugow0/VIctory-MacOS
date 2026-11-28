@@ -1061,6 +1061,20 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!("D3DMetal: pixel attributes read per vertex are derived from interpolated values");
         }
         victory_shader::emit::set_host_derived_vertices(d3dmetal);
+        // D3DMetal makes a mesh pipeline over Metal's 32 KiB (aligned layout) and it then
+        // hangs the queue: such mesh shaders are refused there (docs/macos.md;
+        // ported from pragyaangaur/VIctory-macOS PR #282)
+        victory_shader::emit::set_host_metal_mesh_limit(d3dmetal);
+        // There such a mesh shader is linked with its pixel shader when its
+        // pipeline is made, and refused then if it still does not fit
+        // (`VICTORY_LINK_MESH_OUTPUTS=0`: refused when translated, as above;
+        // `pipeline/link.rs`, ported from pragyaangaur/VIctory-macOS PR
+        // #161/#401/#282)
+        let link = d3dmetal && crate::pipeline::link::requested();
+        if link {
+            tracing::info!("D3DMetal: mesh shaders over Metal's 32 KiB are linked with their pixel shaders");
+        }
+        victory_shader::emit::set_host_mesh_link(link);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

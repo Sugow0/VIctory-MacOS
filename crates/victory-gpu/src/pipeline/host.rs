@@ -455,6 +455,26 @@ impl HostPipeline {
                 s.translated()?;
             }
         }
+        // D3DMetal: a mesh shader over Metal's 32 KiB is linked with its
+        // pixel shader here, or the pipeline refused (`super::link`).
+        let linked = match mesh.map(|ms| super::link::plan(ms, find("pixel").map(Arc::as_ref))) {
+            Some(super::link::Plan::Linked(pair)) => Some(pair),
+            Some(super::link::Plan::Refuse) => {
+                return refuse(
+                    "the mesh shader's outputs pass Metal's 32 KiB, even linked with its pixel shader",
+                    shaders,
+                );
+            }
+            Some(super::link::Plan::Alone) | None => None,
+        };
+        let stages = match &linked {
+            Some((ms, ps)) => {
+                let mut v = vec![(ms, D3D12_SHADER_VISIBILITY_MESH)];
+                v.extend(ps.as_ref().map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+                v
+            }
+            None => stages,
+        };
         let host = host()?;
 
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();

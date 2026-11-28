@@ -60,6 +60,9 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    /// Its full BLAKE3 (the key of a linked mesh and pixel pair, `link`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    full: [u8; 32],
     container: Vec<u8>,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
@@ -116,6 +119,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                full: *full.as_bytes(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
@@ -205,10 +209,35 @@ impl Shader {
 }
 
 #[cfg(windows)]
+impl Shader {
+    /// The same container with `host` as its translation: one half of a
+    /// linked mesh and pixel pair (`link`).
+    fn with_translation(&self, host: victory_shader::emit::HostShader) -> Result<Arc<Shader>, String> {
+        let translated = OnceLock::new();
+        let _ = translated.set(Some(translated_as(&self.container, host)?));
+        Ok(Arc::new(Shader {
+            stage: self.stage,
+            hash: self.hash.clone(),
+            full: self.full,
+            container: self.container.clone(),
+            ambient: self.ambient,
+            probe: self.probe,
+            translated,
+        }))
+    }
+}
+
+#[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
+    translated_as(container, crate::shader_cache::host_shader(container)?)
+}
+
+/// `container` translated as `host`.
+#[cfg(windows)]
+fn translated_as(container: &[u8], host: victory_shader::emit::HostShader) -> Result<Translated, String> {
+    use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
@@ -217,8 +246,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     // Checked again here: a cached translation from before the check came in
     // (an earlier build of the same translator version) can still ask for
     // waves this host does not run.
-    let host = victory_shader::emit::fits_host_wave(crate::shader_cache::host_shader(container)?)
-        .map_err(|e| e.to_string())?;
+    let host = victory_shader::emit::fits_host_wave(host).map_err(|e| e.to_string())?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -773,6 +801,7 @@ pub(crate) mod host;
 pub mod known;
 #[cfg(windows)]
 mod library;
+pub(crate) mod link;
 #[cfg(windows)]
 mod make;
 
